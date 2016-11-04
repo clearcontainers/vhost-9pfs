@@ -1,19 +1,22 @@
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
 #include <linux/compat.h>
 #include <linux/eventfd.h>
 #include <linux/vhost.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
-#include <linux/workqueue.h>
 #include <linux/file.h>
 #include <linux/slab.h>
 
 #include <linux/virtio_9p.h>
 #include <net/9p/9p.h>
-#include <net/9p/client.h>
-#include <net/9p/transport.h>
 
 #include "vhost.h"
+#include "vhost-9p.h"
 
 /* Max number of bytes transferred before requeueing the job.
  * Using this limit prevents one virtqueue from starving others. */
@@ -23,32 +26,24 @@ enum {
 	VHOST_9P_FEATURES = VHOST_FEATURES | (1ULL << VIRTIO_9P_MOUNT_TAG)
 };
 
-enum {
-	VHOST_9P_VQ = 0,
-	VHOST_9P_VQ_MAX = 1,
-};
-
-struct vhost_9p {
-	struct vhost_dev dev;
-	struct vhost_virtqueue vqs[VHOST_9P_VQ_MAX];
-	struct p9_client *c;
-};
-
-struct p9_header {
+struct p9_pdu_header {
 	uint32_t size_le;
 	uint8_t id;
 	uint16_t tag_le;
 } __attribute__((packed));
 
-struct p9_err_pkt {
-	uint32_t size_le;
-	uint8_t id;
-	uint16_t tag_le;
-	uint32_t errno_le;
-} __attribute__((packed));
+static struct p9_fcall *new_pdu(size_t size)
+{
+	struct p9_fcall *pdu;
 
-struct p9_req_t *p9_client_rpc(struct p9_client *c, int8_t type, const char *fmt, ...);
-void p9_free_req(struct p9_client *c, struct p9_req_t *r);
+	pdu = kmalloc(sizeof(struct p9_fcall) + size, GFP_KERNEL);
+	pdu->size = 0;	// size is the write offset, not the size
+	pdu->offset = 0;
+	pdu->capacity = size;
+	pdu->sdata = (void *)pdu + sizeof(struct p9_fcall);
+
+	return pdu;
+}
 
 /* Expects to be always run from workqueue - which acts as
  * read-size critical section for our kind of RCU. */
@@ -60,10 +55,8 @@ static void handle_vq(struct vhost_9p *n)
 	size_t out_len, in_len, total_len = 0;
 	void *private;
 	struct iov_iter iov_iter;
-	struct p9_header hdr;
-	struct p9_req_t *req;
-
-//	printk("VHOST_9P_HANDLE_VQ\n");
+	struct p9_pdu_header *hdr;
+	struct p9_fcall *req, *resp;
 
 	mutex_lock(&vq->mutex);
 	private = vq->private_data;
@@ -79,7 +72,7 @@ static void handle_vq(struct vhost_9p *n)
 					 ARRAY_SIZE(vq->iov),
 					 &out, &in,
 					 NULL, NULL);
-//		printk("VHOST_9P_HANDLE_VQ: head: %d\n", head);
+
 		/* On error, stop handling until the next kick. */
 		if (unlikely(head < 0))
 			break;
@@ -93,43 +86,38 @@ static void handle_vq(struct vhost_9p *n)
 		}
 
 		out_len = iov_length(vq->iov, out);
+		in_len = iov_length(&vq->iov[out], in);
 
 		/* Sanity check */
-		if (out_len < sizeof(struct p9_header)) {
+		if (out_len < sizeof(struct p9_pdu_header)) {
 			vq_err(vq, "Broken 9p request packet.\n");
 			break;
 		}
 
-		/* Send the request to the transport module. */
+		/* Build the request packet. */
+		req = new_pdu(out_len);
 		iov_iter_init(&iov_iter, WRITE, vq->iov, out, out_len);
-		ret = copy_from_iter(&hdr, sizeof(struct p9_header), &iov_iter);
-		req = p9_client_rpc(n->c, hdr.id, "D", &iov_iter);
+		ret = copy_from_iter(req->sdata, out_len, &iov_iter);
 
-		if (IS_ERR(req)) {
-			/* !!! DIRTY FIX !!!
-			   p9_client_rpc won't reply error packets.
-			   However, we need it to inform the client.
-			   So we build it ourselves.
-			 */
-			struct p9_err_pkt err_pkt = {
-				.size_le = sizeof(struct p9_err_pkt),
-				.id = P9_RLERROR,
-				.tag_le = hdr.tag_le,
-				.errno_le = -PTR_ERR(req),
-			};
+		hdr = (struct p9_pdu_header *)req->sdata;
+		req->size = vhost32_to_cpu(vq, hdr->size_le);
+		req->id = hdr->id;
+		req->tag = vhost16_to_cpu(vq, hdr->tag_le);
 
-			iov_iter_init(&iov_iter, READ, &vq->iov[out], in, sizeof(struct p9_err_pkt));
-			ret = copy_to_iter(&err_pkt, sizeof(struct p9_err_pkt), &iov_iter);
-		} else {
-			/* Dump the reply to response */
-			iov_iter_init(&iov_iter, READ, &vq->iov[out], in, req->rc->size);
-			ret = copy_to_iter(req->rc->sdata, req->rc->size, &iov_iter);
-			p9_free_req(n->c, req);
-		}
+		resp = new_pdu(in_len);
+
+		/* Handle the request */
+		do_9p_request(n, req, resp);
+		kfree(req);
+
+		/* Dump the response */
+		iov_iter_init(&iov_iter, READ, &vq->iov[out], in, in_len);
+		ret = copy_to_iter(resp->sdata, resp->size, &iov_iter);
+		kfree(resp);
 
 		vhost_add_used_and_signal(&n->dev, vq, head, in + out);
 
-//		total_len += len;
+		total_len += out_len;
 		if (unlikely(total_len >= VHOST_9P_WEIGHT)) {
 			vhost_poll_queue(&vq->poll);
 			break;
@@ -169,12 +157,7 @@ static int vhost_9p_open(struct inode *inode, struct file *f)
 
 	dev = &n->dev;
 
-	n->c = p9_client_create("/home/guoyk/Desktop/vhost-9p/a", "trans=local");
-	if (IS_ERR(n->c)) {
-		kfree(n);
-		kfree(vqs);
-		return PTR_ERR(n->c);
-	}
+	p9_ops_init(n, "/home/guoyk/Desktop/vhost-9p/a");
 
 	vqs[VHOST_9P_VQ] = &n->vqs[VHOST_9P_VQ];
 	n->vqs[VHOST_9P_VQ].handle_kick = handle_vq_kick;
@@ -226,12 +209,9 @@ static int vhost_9p_release(struct inode *inode, struct file *f)
 	 * since jobs can re-queue themselves. */
 	vhost_9p_flush(n);
 
-	p9_client_destroy(n->c);
-
 	kfree(n);
 	return 0;
 }
-
 
 static long vhost_9p_reset_owner(struct vhost_9p *n)
 {
@@ -348,6 +328,6 @@ static void vhost_9p_exit(void)
 module_exit(vhost_9p_exit);
 
 MODULE_VERSION("0.0.1");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Yuankai Guo");
 MODULE_DESCRIPTION("In-kernel vhost 9P server");
