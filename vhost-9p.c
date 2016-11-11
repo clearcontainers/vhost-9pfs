@@ -26,45 +26,17 @@ enum {
 	VHOST_9P_FEATURES = VHOST_FEATURES | (1ULL << VIRTIO_9P_MOUNT_TAG)
 };
 
-struct p9_pdu_header {
-	uint32_t size_le;
-	uint8_t id;
-	uint16_t tag_le;
-} __attribute__((packed));
-
-static struct p9_fcall *new_pdu(size_t size)
-{
-	struct p9_fcall *pdu;
-
-	pdu = kmalloc(sizeof(struct p9_fcall) + size, GFP_KERNEL);
-	pdu->size = 0;	// size is the write offset, not the size
-	pdu->offset = 0;
-	pdu->capacity = size;
-	pdu->sdata = (void *)pdu + sizeof(struct p9_fcall);
-
-	return pdu;
-}
-
 /* Expects to be always run from workqueue - which acts as
  * read-size critical section for our kind of RCU. */
 static void handle_vq(struct vhost_9p *n)
 {
 	struct vhost_virtqueue *vq = &n->vqs[VHOST_9P_VQ];
 	unsigned out, in;
-	int head, ret;
+	int head;
 	size_t out_len, in_len, total_len = 0;
-	void *private;
-	struct iov_iter iov_iter;
-	struct p9_pdu_header *hdr;
-	struct p9_fcall *req, *resp;
+	struct iov_iter req, resp;
 
 	mutex_lock(&vq->mutex);
-	private = vq->private_data;
-/*	if (!private) {
-		mutex_unlock(&vq->mutex);
-		return;
-	}
-*/
 	vhost_disable_notify(&n->dev, vq);
 
 	for (;;) {
@@ -88,32 +60,10 @@ static void handle_vq(struct vhost_9p *n)
 		out_len = iov_length(vq->iov, out);
 		in_len = iov_length(&vq->iov[out], in);
 
-		/* Sanity check */
-		if (out_len < sizeof(struct p9_pdu_header)) {
-			vq_err(vq, "Broken 9p request packet.\n");
-			break;
-		}
+		iov_iter_init(&req, WRITE, vq->iov, out, out_len);
+		iov_iter_init(&resp, READ, &vq->iov[out], in, in_len);
 
-		/* Build the request packet. */
-		req = new_pdu(out_len);
-		iov_iter_init(&iov_iter, WRITE, vq->iov, out, out_len);
-		ret = copy_from_iter(req->sdata, out_len, &iov_iter);
-
-		hdr = (struct p9_pdu_header *)req->sdata;
-		req->size = vhost32_to_cpu(vq, hdr->size_le);
-		req->id = hdr->id;
-		req->tag = vhost16_to_cpu(vq, hdr->tag_le);
-
-		resp = new_pdu(in_len);
-
-		/* Handle the request */
-		do_9p_request(n, req, resp);
-		kfree(req);
-
-		/* Dump the response */
-		iov_iter_init(&iov_iter, READ, &vq->iov[out], in, in_len);
-		ret = copy_to_iter(resp->sdata, resp->size, &iov_iter);
-		kfree(resp);
+		do_9p_request(n, &req, &resp);
 
 		vhost_add_used_and_signal(&n->dev, vq, head, in + out);
 

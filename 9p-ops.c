@@ -115,6 +115,11 @@ static struct p9_local_fid *new_fid(struct vhost_9p *dev, u32 fid_val,
 	return fid;
 }
 
+static void iov_iter_clone(struct iov_iter *dst, struct iov_iter *src)
+{
+	memcpy(dst, src, sizeof(struct iov_iter));
+}
+
 static int lstat(const char *real_path, struct kstat *out)
 {
 	int err;
@@ -307,6 +312,7 @@ static int p9_local_op_walk(struct vhost_9p *dev, struct p9_fcall *in,
 	out->size = P9_PDU_HDR_LEN;
 	p9pdu_writef(out, "w", nwqid);
 	out->size = t;
+
 	return 0;
 }
 
@@ -547,6 +553,38 @@ static int p9_local_op_read(struct vhost_9p *dev, struct p9_fcall *in,
 	return 0;
 }
 
+static int p9_local_op_readv(struct vhost_9p *dev, struct p9_fcall *in,
+							struct p9_fcall *out, struct iov_iter *data)
+{
+	u32 fid_val, count;
+	u64 offset;
+	ssize_t len;
+	struct p9_local_fid *fid;
+	mm_segment_t fs;
+
+	p9pdu_readf(in, "dqd", &fid_val, &offset, &count);
+
+	fid = find_fid(dev, fid_val);
+	if (IS_ERR(fid))
+		return PTR_ERR(fid);
+
+	if (data->count > count)
+		data->count = count;
+
+	fs = get_fs();
+	set_fs(KERNEL_DS);
+	len = vfs_iter_read(fid->filp, data, &offset);
+	set_fs(fs);
+
+	if (len < 0)
+		return len;
+
+	p9pdu_writef(out, "d", (u32) len);
+	out->size += len;
+
+	return 0;
+}
+
 #define ATTR_MASK	127
 
 static int p9_local_op_setattr(struct vhost_9p *dev, struct p9_fcall *in,
@@ -649,6 +687,36 @@ static int p9_local_op_write(struct vhost_9p *dev, struct p9_fcall *in,
 	fs = get_fs();
 	set_fs(KERNEL_DS);
 	len = vfs_write(fid->filp, in->sdata + in->offset, count, &offset);
+	set_fs(fs);
+
+	if (len < 0)
+		return len;
+
+	p9pdu_writef(out, "d", (u32) len);
+	return 0;
+}
+
+static int p9_local_op_writev(struct vhost_9p *dev, struct p9_fcall *in,
+							 struct p9_fcall *out, struct iov_iter *data)
+{
+	u64 offset;
+	u32 fid_val, count;
+	ssize_t len;
+	struct p9_local_fid *fid;
+	mm_segment_t fs;
+
+	p9pdu_readf(in, "dqd", &fid_val, &offset, &count);
+
+	fid = find_fid(dev, fid_val);
+	if (IS_ERR(fid))
+		return PTR_ERR(fid);
+
+	if (data->count > count)
+		data->count = count;
+
+	fs = get_fs();
+	set_fs(KERNEL_DS);
+	len = vfs_iter_write(fid->filp, data, &offset);
 	set_fs(fs);
 
 	if (len < 0)
@@ -1147,18 +1215,103 @@ static const char *translate [] = {
 	[P9_TWSTAT]       = "wstat",
 };
 
-void do_9p_request(struct vhost_9p *dev, struct p9_fcall *in, struct p9_fcall *out)
+struct p9_header {
+	uint32_t size;
+	uint8_t id;
+	uint16_t tag;
+} __attribute__((packed));
+
+struct p9_io_header {
+	uint32_t size;
+	uint8_t id;
+	uint16_t tag;
+	uint32_t fid;
+	uint64_t offset;
+	uint32_t count;
+} __attribute__((packed));
+
+static struct p9_fcall *new_pdu(size_t size)
+{
+	struct p9_fcall *pdu;
+
+	pdu = kmalloc(sizeof(struct p9_fcall) + size, GFP_KERNEL);
+	pdu->size = 0;	// write offset
+	pdu->offset = 0;	// read offset
+	pdu->capacity = size;
+	pdu->sdata = (void *)pdu + sizeof(struct p9_fcall);	// Make the data area right after the pdu structure
+
+	return pdu;
+}
+
+static size_t pdu_fill(struct p9_fcall *pdu, struct iov_iter *from, size_t size)
+{
+	size_t ret, len;
+
+	len = min(pdu->capacity - pdu->size, size);
+	ret = copy_from_iter(&pdu->sdata[pdu->size], len, from);
+
+	pdu->size += ret;
+	return size - ret;
+}
+
+/*
+Quirks for performance optimization
+1. copy size is io_header
+
+ */
+
+void do_9p_request(struct vhost_9p *dev, struct iov_iter *req, struct iov_iter *resp)
 {
 	int err = -EOPNOTSUPP;
-	u8 cmd = in->id;
-	u16 tag = in->tag;
+	u8 cmd;
+	struct iov_iter data;
+	struct p9_fcall *in, *out;
+	struct p9_header *hdr;
+	struct p9_io_header *io_hdr;
 
-//	printk("GUOYK: do_9p_request: %s! %d\n", translate[cmd], tag);
+	in = new_pdu(req->count);
+	out = new_pdu(resp->count);
+
+	pdu_fill(in, req, sizeof(struct p9_io_header));
+	hdr = (struct p9_header *)in->sdata;
+
+	in->offset = out->size = sizeof(struct p9_header);
+	in->tag = out->tag = hdr->tag;
+	in->id = cmd = hdr->id;
+	out->id = hdr->id + 1;
+
+//	printk("GUOYK: do_9p_request: %s! %d\n", translate[cmd], in->tag);
 
 	if (cmd < ARRAY_SIZE(p9_local_ops) && p9_local_ops[cmd]) {
-		in->offset = P9_PDU_HDR_LEN;	// Reset the request PDU for read.
-		p9pdu_prepare(out, tag, cmd + 1);	// Request type plus 1 is the corresponding reply type
-		err = p9_local_ops[cmd](dev, in, out);	// Call the handler
+		if (cmd == P9_TREAD || cmd == P9_TWRITE) {
+			io_hdr = (struct p9_io_header *) hdr;
+
+			/* Do zero-copy for large IO */
+			if (io_hdr->count > 1024) {
+				if (cmd == P9_TREAD) {
+					iov_iter_clone(&data, resp);
+					iov_iter_advance(&data, sizeof(struct p9_header) + sizeof(u32));
+					resp->count = sizeof(struct p9_header) + sizeof(u32);	// Hack
+
+					err = p9_local_op_readv(dev, in, out, &data);
+				} else
+					err = p9_local_op_writev(dev, in, out, req);
+			} else {
+				if (cmd == P9_TWRITE) {
+					pdu_fill(in, req, io_hdr->count);
+					err = p9_local_op_write(dev, in, out);
+				} else
+					err = p9_local_op_read(dev, in, out);
+			}
+		} else {
+			/* Copy the rest data */
+			if (hdr->size > sizeof(struct p9_io_header))
+				pdu_fill(in, req, hdr->size - sizeof(struct p9_io_header));
+
+			err = p9_local_ops[cmd](dev, in, out);
+		}
+
+		kfree(in);
 	} else {
 		if (cmd < ARRAY_SIZE(p9_local_ops))
 			printk("GUOYK: !!!not implemented: %s\n", translate[cmd]);
@@ -1168,12 +1321,19 @@ void do_9p_request(struct vhost_9p *dev, struct p9_fcall *in, struct p9_fcall *o
 
 	if (err) {
 		/* Compose an error reply */
-		p9pdu_reset(out);
-		p9pdu_prepare(out, tag, P9_RLERROR);
-		p9pdu_writef(out, "d", (u32) -err);
+		out->size = 0;
+		p9pdu_writef(out, "dbwd", 
+			sizeof(struct p9_header) + sizeof(u32), 
+			P9_RLERROR, out->tag, (u32) -err);
+	} else {
+		size_t t = out->size;
+		out->size = 0;
+		p9pdu_writef(out, "dbw", t, out->id, out->tag);
+		out->size = t;
 	}
 
-	p9pdu_finalize(out);
+	copy_to_iter(out->sdata, out->size, resp);
+	kfree(out);
 }
 
 int p9_ops_init(struct vhost_9p *dev, const char *root_dir)

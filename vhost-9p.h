@@ -18,6 +18,6 @@ struct vhost_9p {
 };
 
 int p9_ops_init(struct vhost_9p *m, const char *root_dir);
-void do_9p_request(struct vhost_9p *m, struct p9_fcall *req, struct p9_fcall *resp);
+void do_9p_request(struct vhost_9p *m, struct iov_iter *req, struct iov_iter *resp);
 
 #endif
