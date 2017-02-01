@@ -29,33 +29,28 @@ const size_t P9_PDU_HDR_LEN = sizeof(u32) + sizeof(u8) + sizeof(u16);
 /*
 	TODO:
 		- Do not use syscalls
-		- Use inode_op and file_op
-		- use path and dentry to replace real_path and path
 		- Full support of setattr
 		- chmod
-		- Zero-copy
 		- Should have a lock to protect fids
-		- Security: parent dir reference
 */
 
-struct p9_local_fid {
+struct p9_server_fid {
 	u32 fid;
 	u32 uid;
-	char real_path[PATH_MAX];	// Absolute path in the file system
-	char *path;					// Relative path to the base. Starts with "/"
+	struct path path;
 	struct file *filp;
 	struct rb_node node;
 };
 
 /* 9p helper routines */
 
-static struct p9_local_fid *find_fid(struct vhost_9p *dev, u32 fid_val)
+static struct p9_server_fid *lookup_fid(struct p9_server *s, u32 fid_val)
 {
-	struct rb_node *node = dev->fids.rb_node;
-	struct p9_local_fid *cur;
+	struct rb_node *node = s->fids.rb_node;
+	struct p9_server_fid *cur;
 
 	while (node) {
-		cur = rb_entry(node, struct p9_local_fid, node);
+		cur = rb_entry(node, struct p9_server_fid, node);
 
 		if (fid_val < cur->fid)
 			node = node->rb_left;
@@ -68,33 +63,14 @@ static struct p9_local_fid *find_fid(struct vhost_9p *dev, u32 fid_val)
 	return ERR_PTR(-ENOENT);
 }
 
-static struct p9_local_fid *alloc_fid(struct vhost_9p *dev, u32 fid_val,
-									  const char *path)
+static struct p9_server_fid *new_fid(struct p9_server *s, u32 fid_val,
+									struct path *path)
 {
-	struct p9_local_fid *fid;
-
-	fid = kmalloc(sizeof(struct p9_local_fid), GFP_KERNEL);
-	if (!fid)
-		return NULL;
-
-	fid->fid = fid_val;
-	fid->uid = dev->uid;
-	fid->filp = NULL;
-
-	snprintf(fid->real_path, PATH_MAX, "%s%s", dev->base, path);
-	fid->path = fid->real_path + strlen(dev->base);
-
-	return fid;
-}
-
-static struct p9_local_fid *new_fid(struct vhost_9p *dev, u32 fid_val,
-									const char *path)
-{
-	struct p9_local_fid *fid;
-	struct rb_node **node = &(dev->fids.rb_node), *parent = NULL;
+	struct p9_server_fid *fid;
+	struct rb_node **node = &(s->fids.rb_node), *parent = NULL;
 
 	while (*node) {
-		int result = fid_val - rb_entry(*node, struct p9_local_fid, node)->fid;
+		int result = fid_val - rb_entry(*node, struct p9_server_fid, node)->fid;
 
 		parent = *node;
 		if (result < 0)
@@ -105,46 +81,27 @@ static struct p9_local_fid *new_fid(struct vhost_9p *dev, u32 fid_val,
 			return ERR_PTR(-EEXIST);
 	}
 
-	fid = alloc_fid(dev, fid_val, path);
+	fid = kmalloc(sizeof(struct p9_server_fid), GFP_KERNEL);
 	if (!fid)
 		return ERR_PTR(-ENOMEM);
 
+	fid->fid = fid_val;
+	fid->uid = s->uid;
+	fid->filp = NULL;
+	fid->path = *path;
+
 	rb_link_node(&fid->node, parent, node);
-	rb_insert_color(&fid->node, &dev->fids);
+	rb_insert_color(&fid->node, &s->fids);
 
 	return fid;
 }
 
-static void iov_iter_clone(struct iov_iter *dst, struct iov_iter *src)
+static inline void iov_iter_clone(struct iov_iter *dst, struct iov_iter *src)
 {
 	memcpy(dst, src, sizeof(struct iov_iter));
 }
 
-static int lstat(const char *real_path, struct kstat *out)
-{
-	int err;
-	mm_segment_t fs;
-
-	fs = get_fs();
-	set_fs(KERNEL_DS);
-	err = vfs_lstat(real_path, out);
-	set_fs(fs);
-
-	return err;
-}
-
-static void stat2qid(struct kstat *st, struct p9_qid *qid)
-{
-	*qid = (struct p9_qid) {
-		.path		= st->ino,
-		.version	= st->mtime.tv_sec,
-	};
-
-	if (S_ISDIR(st->mode))
-		qid->type	|= P9_QTDIR;
-}
-
-static int gen_qid(const char *real_path, struct p9_qid *qid, struct kstat *st)
+static int gen_qid(struct path *path, struct p9_qid *qid, struct kstat *st)
 {
 	int err;
 	struct kstat _st;
@@ -152,18 +109,28 @@ static int gen_qid(const char *real_path, struct p9_qid *qid, struct kstat *st)
 	if (!st)
 		st = &_st;
 
-	err = lstat(real_path, st);
+	err = vfs_getattr(path, st);
 	if (err)
 		return err;
 
-	stat2qid(st, qid);
+	/* TODO: incomplete types */
+	qid->version = st->mtime.tv_sec;
+	qid->path = st->ino;
+	qid->type = P9_QTFILE;
+
+	if (S_ISDIR(st->mode))
+		qid->type |= P9_QTDIR;
+
+	if (S_ISLNK(st->mode))
+		qid->type |= P9_QTSYMLINK;
+
 	return 0;
 }
 
 /* 9p operation functions */
 
-static int p9_local_op_version(struct vhost_9p *dev, struct p9_fcall *in,
-							   struct p9_fcall *out)
+static int p9_op_version(struct p9_server *s, struct p9_fcall *in,
+						 struct p9_fcall *out)
 {
 	u32 msize;
 	char *version;
@@ -178,14 +145,14 @@ static int p9_local_op_version(struct vhost_9p *dev, struct p9_fcall *in,
 	kfree(version);
 	return 0;
 }
-
-static int p9_local_op_attach(struct vhost_9p *dev, struct p9_fcall *in,
-							  struct p9_fcall *out)
+// TODO: uname, aname, uid, afid
+static int p9_op_attach(struct p9_server *s, struct p9_fcall *in,
+						struct p9_fcall *out)
 {
 	int err;
 	char *uname, *aname;
 	struct p9_qid qid;
-	struct p9_local_fid *fid;
+	struct p9_server_fid *fid;
 	u32 fid_val, afid, uid;
 
 	p9pdu_readf(in, "ddssd", &fid_val, &afid,
@@ -193,39 +160,39 @@ static int p9_local_op_attach(struct vhost_9p *dev, struct p9_fcall *in,
 	kfree(uname);
 	kfree(aname);
 
-	dev->uid = uid;
-	fid = find_fid(dev, fid_val);
+	s->uid = uid;
+	fid = lookup_fid(s, fid_val);
 	if (IS_ERR(fid)) {
-		fid = new_fid(dev, fid_val, "");
+		fid = new_fid(s, fid_val, &s->root);
 		if (IS_ERR(fid))
 			return PTR_ERR(fid);
 	}
 
-	err = gen_qid(fid->real_path, &qid, NULL);
+	err = gen_qid(&fid->path, &qid, NULL);
 	if (err)
 		return err;
 
 	p9pdu_writef(out, "Q", &qid);
 	return 0;
 }
-
-static int p9_local_op_getattr(struct vhost_9p *dev, struct p9_fcall *in,
-								struct p9_fcall *out)
+// TODO: request_mask
+static int p9_op_getattr(struct p9_server *s, struct p9_fcall *in,
+						 struct p9_fcall *out)
 {
 	int err;
 	u32 fid_val;
 	u64 request_mask;
-	struct p9_local_fid *fid;
+	struct p9_server_fid *fid;
 	struct kstat st;
 	struct p9_qid qid;
 
 	p9pdu_readf(in, "dq", &fid_val, &request_mask);
 
-	fid = find_fid(dev, fid_val);
+	fid = lookup_fid(s, fid_val);
 	if (IS_ERR(fid))
 		return PTR_ERR(fid);
 
-	err = gen_qid(fid->real_path, &qid, &st);
+	err = gen_qid(&fid->path, &qid, &st);
 	if (err)
 		return err;
 
@@ -240,73 +207,105 @@ static int p9_local_op_getattr(struct vhost_9p *dev, struct p9_fcall *in,
 	return 0;
 }
 
-static int p9_local_op_clunk(struct vhost_9p *dev, struct p9_fcall *in,
-							 struct p9_fcall *out)
+static int p9_op_clunk(struct p9_server *s, struct p9_fcall *in,
+					   struct p9_fcall *out)
 {
 	u32 fid_val;
-	struct p9_local_fid *fid;
+	struct p9_server_fid *fid;
 
 	p9pdu_readf(in, "d", &fid_val);
 
-	fid = find_fid(dev, fid_val);
+	fid = lookup_fid(s, fid_val);
 	if (IS_ERR(fid))
-		return PTR_ERR(fid);
+		return 0;
 
 	if (!IS_ERR_OR_NULL(fid->filp))
 		filp_close(fid->filp, NULL);
 
-	rb_erase(&fid->node, &dev->fids);
+	rb_erase(&fid->node, &s->fids);
 	kfree(fid);
 
 	return 0;
 }
-
-static int p9_local_op_walk(struct vhost_9p *dev, struct p9_fcall *in,
-							struct p9_fcall *out)
+/*
+	http://man.cat-v.org/plan_9/5/walk
+ */
+static int p9_op_walk(struct p9_server *s, struct p9_fcall *in,
+					  struct p9_fcall *out)
 {
 	int err;
 	size_t t;
 	u16 nwqid, nwname;
 	u32 fid_val, newfid_val;
+	char * name;
 	struct p9_qid qid;
-	struct p9_local_fid *fid, *newfid;
-	char *name, *tail;
+	struct p9_server_fid *fid, *newfid;
+	struct path new_path;
 
 	p9pdu_readf(in, "ddw", &fid_val, &newfid_val, &nwname);
 
-	fid = find_fid(dev, fid_val);
+	/* Get the indicated fid. */
+	fid = lookup_fid(s, fid_val);
 	if (IS_ERR(fid))
 		return PTR_ERR(fid);
 
-	if (fid_val == newfid_val) {
-		/* Fake an fid for path storage */
-		newfid = alloc_fid(dev, newfid_val, fid->path);
-	} else {
-		newfid = new_fid(dev, newfid_val, fid->path);
-		if (IS_ERR(newfid))
-			return PTR_ERR(newfid);
-	}
+	/* Check if the newfid already exists. */
+	newfid = lookup_fid(s, newfid_val);
+	if (!IS_ERR(newfid) && newfid_val != fid_val)
+		return -EEXIST;
 
-	t = strlen(newfid->real_path);
-	tail = newfid->real_path + t;
-	t = PATH_MAX - t;
-
+	new_path = fid->path;
+	nwqid = 0;
 	out->size += sizeof(u16);
 
-	for (nwqid = 0; nwqid < nwname; nwqid++) {
-		p9pdu_readf(in, "s", &name);
-		snprintf(tail, t, "/%s", name);
-		kfree(name);
+	if (nwname) {
+		for (; nwqid < nwname; nwqid++) {
+			p9pdu_readf(in, "s", &name);
 
-		err = gen_qid(newfid->real_path, &qid, NULL);
+			/* ".." is not allowed. */
+			if (name[0] == '.' && name[1] == '.' && name[2] =='\0')
+				break;
+
+			// TODO: lock may be needed
+			new_path.dentry = lookup_one_len(name, fid->path.dentry, strlen(name));
+			kfree(name);
+
+			if (IS_ERR(new_path.dentry)) {
+				err = PTR_ERR(new_path.dentry);
+				break;
+			} else if (d_really_is_negative(new_path.dentry)) {
+				err = -ENOENT;
+				break;
+			}
+
+			err = gen_qid(&new_path, &qid, NULL);
+			if (err)
+				break;
+
+			// TODO: verify if it's valid
+			dput(new_path.dentry);
+
+			p9pdu_writef(out, "Q", &qid);
+		}
+
+		if (!nwqid)
+			return err;
+	} else {
+		/* If nwname is 0, it's equivalent to walking to the current directory. */
+		err = gen_qid(&new_path, &qid, NULL);
 		if (err)
-			break;
+			return err;
 
 		p9pdu_writef(out, "Q", &qid);
 	}
 
-	if (fid_val == newfid_val)
-		kfree(newfid);
+	if (fid_val == newfid_val) {
+		fid->path = new_path;
+	} else {
+		newfid = new_fid(s, newfid_val, &new_path);
+		if (IS_ERR(newfid))
+			return PTR_ERR(newfid);
+	}
 
 	t = out->size;
 	out->size = P9_PDU_HDR_LEN;
@@ -316,26 +315,22 @@ static int p9_local_op_walk(struct vhost_9p *dev, struct p9_fcall *in,
 	return 0;
 }
 
-static int p9_local_op_statfs(struct vhost_9p *dev, struct p9_fcall *in,
-							  struct p9_fcall *out)
+static int p9_op_statfs(struct p9_server *s, struct p9_fcall *in,
+						struct p9_fcall *out)
 {
 	int err;
 	u64 fsid;
 	u32 fid_val;
-	struct p9_local_fid *fid;
-	struct statfs st;
-	mm_segment_t fs;
+	struct p9_server_fid *fid;
+	struct kstatfs st;
 
 	p9pdu_readf(in, "d", &fid_val);
-	fid = find_fid(dev, fid_val);
+
+	fid = lookup_fid(s, fid_val);
 	if (IS_ERR(fid))
 		return PTR_ERR(fid);
 
-	fs = get_fs();
-	set_fs(KERNEL_DS);
-	err = sys_statfs(fid->real_path, &st);
-	set_fs(fs);
-
+	err = vfs_statfs(&fid->path, &st);
 	if (err)
 		return err;
 
@@ -354,33 +349,41 @@ static int p9_local_op_statfs(struct vhost_9p *dev, struct p9_fcall *in,
  * FIXME!! Need to map to protocol independent value. Upstream
  * 9p also have the same BUG
  */
-static int p9_local_openflags(int flags)
+static int build_openflags(int flags)
 {
 	flags &= ~(O_NOCTTY | FASYNC | O_CREAT | O_DIRECT);
 	flags |= O_NOFOLLOW;
 	return flags;
 }
 
-static int p9_local_op_open(struct vhost_9p *dev, struct p9_fcall *in,
-							struct p9_fcall *out)
+static int p9_op_open(struct p9_server *s, struct p9_fcall *in,
+					  struct p9_fcall *out)
 {
 	int err;
 	u32 fid_val, flags;
 	struct p9_qid qid;
-	struct p9_local_fid *fid;
+	struct p9_server_fid *fid;
 
 	p9pdu_readf(in, "dd", &fid_val, &flags);
-	fid = find_fid(dev, fid_val);
+
+	fid = lookup_fid(s, fid_val);
+
 	if (IS_ERR(fid))
 		return PTR_ERR(fid);
+	else if (fid->filp)	// TODO: verify if being error is also considered busy
+		return -EBUSY;
 
-	err = gen_qid(fid->real_path, &qid, NULL);
+	err = gen_qid(&fid->path, &qid, NULL);
+
 	if (err)
 		return err;
 
-	fid->filp = filp_open(fid->real_path, p9_local_openflags(flags), 0);
-	if (IS_ERR(fid->filp))
+	fid->filp = dentry_open(&fid->path, build_openflags(flags), current_cred());
+
+	if (IS_ERR(fid->filp)) {
+		fid->filp = NULL;
 		return PTR_ERR(fid->filp);
+	}
 
 	/* FIXME!! need ot send proper iounit  */
 	p9pdu_writef(out, "Qd", &qid, 0L);
@@ -388,150 +391,212 @@ static int p9_local_op_open(struct vhost_9p *dev, struct p9_fcall *in,
 	return 0;
 }
 
-static int p9_local_op_create(struct vhost_9p *dev, struct p9_fcall *in,
-							  struct p9_fcall *out)
+static int p9_op_create(struct p9_server *s, struct p9_fcall *in,
+						struct p9_fcall *out)
 {
 	int err;
 	char *name;
+	u32 dfid_val, flags, mode, gid;
 	struct p9_qid qid;
-	struct p9_local_fid *fid;
-	u32 fid_val, flags, mode, gid;
+	struct p9_server_fid *dfid;
+	struct path new_path;
+	struct file *new_filp;
 
-	p9pdu_readf(in, "d", &fid_val);
-	fid = find_fid(dev, fid_val);
-	if (IS_ERR(fid))
-		return PTR_ERR(fid);
+	p9pdu_readf(in, "d", &dfid_val);
+
+	dfid = lookup_fid(s, dfid_val);
+
+	if (IS_ERR(dfid))
+		return PTR_ERR(dfid);
+	else if (dfid->filp)
+		return -EBUSY;
 
 	p9pdu_readf(in, "sddd", &name, &flags, &mode, &gid);
-	snprintf(fid->real_path, PATH_MAX, "%s/%s", fid->real_path, name);
+
+	new_path.mnt = dfid->path.mnt;
+	new_path.dentry = lookup_one_len(name, dfid->path.dentry, strlen(name));
+
 	kfree(name);
 
-	fid->filp = filp_open(fid->real_path, p9_local_openflags(flags) | O_CREAT, mode);
-	if (IS_ERR(fid->filp))
-		return PTR_ERR(fid->filp);
-
-/*	err = chmod(fid->real_path, mode & 0777);
-	if (err < 0)
-		return err;
-*/
-	err = gen_qid(fid->real_path, &qid, NULL);
-	if (err)
-		return err;
-
-	p9pdu_writef(out, "Qd", &qid, 0L);
-
-	return 0;
-}
-
-struct p9_local_dirent {
-	u64 d_off;
-	u8 d_type;
-	const char *d_name;
-};
-
-struct readdir_callback {
-	struct dir_context ctx;
-	size_t i, n;
-	struct p9_local_dirent *out;
-};
-
-/* Callback function from iterate_dir */
-
-static int fill_dirent(struct dir_context *ctx, const char *name, int namlen,
-		   loff_t offset, u64 ino, unsigned int d_type)
-{
-	struct p9_local_dirent *dirent;
-	struct readdir_callback *buf = container_of(ctx, struct readdir_callback, ctx);
-
-	if (buf->i >= buf->n)
-		return EINVAL;
-
-	dirent = &buf->out[buf->i++];
-	dirent->d_off = offset;	// BUG: offset should be put to the previous dirent
-	dirent->d_name = name;
-	dirent->d_type = d_type;
-
-	return 0;
-}
-
-static int p9_local_op_readdir(struct vhost_9p *dev, struct p9_fcall *in,
-							   struct p9_fcall *out)
-{
-	int err;
-	u32 fid_val, count;
-	u64 offset;
-	struct p9_qid qid;
-	struct p9_local_fid *fid;
-	struct p9_local_dirent *dent;
-	char *path, *tail;
-	size_t i, t;
-	struct readdir_callback buf = {
-		.ctx.actor = fill_dirent,
-		.i = 0,
-	};
-
-	p9pdu_readf(in, "dqd", &fid_val, &offset, &count);
-
-	/* TODO: meaning of offset unknown */
-//	printk("GUOYK: offset: %lld\n", offset);
-
-	fid = find_fid(dev, fid_val);
-	if (IS_ERR(fid))
-		return PTR_ERR(fid);
-
-//	buf.ctx.pos = offset;
-	buf.n = count / sizeof(struct p9_local_dirent);
-	buf.out = kmalloc(count, GFP_KERNEL);
-
-	err = iterate_dir(fid->filp, &buf.ctx);
-	if (err)
-		return err;
-
-	out->size += sizeof(u32);	// Skip the space for writing count
-
-	path = kmalloc(PATH_MAX, GFP_KERNEL);
-	strcpy(path, fid->real_path);
-	t = strlen(path);
-	tail = path + t;
-	t = PATH_MAX - t;
-
-	for (i = 0; i < buf.i; i++) {
-		dent = &buf.out[i];
-		snprintf(tail, t, "/%s", dent->d_name);
-
-		err = gen_qid(path, &qid, NULL);
-		if (err)
-			return err;
-
-		p9pdu_writef(out, "Qqbs", &qid, dent->d_off,
-					 dent->d_type, dent->d_name);
+	if (IS_ERR(new_path.dentry))
+		return PTR_ERR(new_path.dentry);
+	else if (d_really_is_positive(new_path.dentry)) {
+		printk("GUOYK: create: postive dentry!\n");
+		return -EEXIST;
 	}
 
-	kfree(path);
-	kfree(buf.out);
+	err = vfs_create(dfid->path.dentry->d_inode, new_path.dentry, 
+					 mode, build_openflags(flags) & O_EXCL);
+	if (err)
+		return err;
 
-	t = out->size - P9_PDU_HDR_LEN - sizeof(u32);
+	new_filp = dentry_open(&new_path, build_openflags(flags) | O_CREAT, current_cred());
+	if (IS_ERR(new_filp))
+		return PTR_ERR(new_filp);
+
+	err = gen_qid(&new_path, &qid, NULL);
+	if (err)
+		goto err;
+
+	dfid->path = new_path;
+	dfid->filp = new_filp;
+
+	p9pdu_writef(out, "Qd", &qid, 0L);
+	return 0;
+err:
+	filp_close(new_filp, NULL);
+	return err;
+}
+
+struct p9_readdir_ctx {
+	size_t i, count;
+	int err;
+	bool is_root;
+
+	struct dir_context ctx;
+	struct path *parent;
+	struct p9_fcall *out;
+
+	struct {
+		struct p9_qid qid;
+		const char *name;
+		unsigned int d_type;
+	} prev;
+};
+
+/*
+ *	The callback function from iterate_dir.
+ *
+ *	Note: returning non-zero terminates the executing of iterate_dir.
+ *		  However, iterate_dir will still return zero.
+ *
+ *	Note: weird logic: the offset is of the previous element. So we
+ *		  deal with the previous element in each iteration.
+ */
+
+static int p9_readdir_cb(struct dir_context *ctx, const char *name, int namlen,
+						 loff_t offset, u64 ino, unsigned int d_type)
+{
+	size_t write_len;
+	struct path path;
+	struct p9_readdir_ctx *_ctx = container_of(ctx, struct p9_readdir_ctx, ctx);
+
+	write_len = sizeof(u8) + 	// qid.type. Not using sizeof(struct p9_qid) because of the size is padded.
+				sizeof(u32) + 	// qid.version
+				sizeof(u64) + 	// qid.path
+				sizeof(u64) + 	// offset
+				sizeof(u8) + 	// d_type
+				sizeof(u16) + 	// name.len
+				namlen;			// name
+
+	// If writting this dirent would cause an overflow, terminate iterate_dir.
+	if (_ctx->i + write_len > _ctx->count)
+		return 1;
+
+	// Writting the previous element with current offset
+	if (_ctx->i)
+		p9pdu_writef(_ctx->out, "Qqbs", &_ctx->prev.qid, (u64) offset, _ctx->prev.d_type, _ctx->prev.name);
+
+	/* Prepare the dirent for the next iteration. */
+
+	path.mnt = _ctx->parent->mnt;
+
+	// lookup_one_len doesn't allow the lookup of "." and "..". We have to do it ourselves.
+	if (namlen == 1 && name[0] == '.')
+		path.dentry = _ctx->parent->dentry;
+	else if (namlen == 2 && name[0] == '.' && name[1] == '.')
+		// No ".." allowed on the mount root
+		path.dentry = _ctx->is_root ? _ctx->parent->dentry : _ctx->parent->dentry->d_parent;
+	else
+		path.dentry = lookup_one_len(name, _ctx->parent->dentry, namlen);
+
+	if (IS_ERR(path.dentry)) {
+		_ctx->err = PTR_ERR(path.dentry);
+		goto out;
+	} else if (d_really_is_negative(path.dentry)) {
+		_ctx->err = -ENOENT;
+		goto out;
+	}
+
+	_ctx->err = gen_qid(&path, &_ctx->prev.qid, NULL);
+	if (_ctx->err)
+		goto out;
+
+	_ctx->prev.name = name;
+	_ctx->prev.d_type = d_type;
+
+	_ctx->i += write_len;
+out:
+	return _ctx->err;
+}
+
+static int p9_op_readdir(struct p9_server *s, struct p9_fcall *in,
+						 struct p9_fcall *out)
+{
+	int err;
+	u32 dfid_val, count;
+	u64 offset;
+	struct p9_server_fid *dfid;
+	struct p9_readdir_ctx _ctx = {
+		.ctx.actor = p9_readdir_cb
+	};
+
+	p9pdu_readf(in, "dqd", &dfid_val, &offset, &count);
+
+	dfid = lookup_fid(s, dfid_val);
+	if (IS_ERR(dfid))
+		return PTR_ERR(dfid);
+
+	if (IS_ERR_OR_NULL(dfid->filp))
+		return -EBADF;
+
+	err = vfs_llseek(dfid->filp, offset, SEEK_SET);
+	if (err < 0)
+		return err;
+
+	_ctx.parent = &dfid->path;
+	_ctx.out = out;
+	_ctx.i = 0;
+	_ctx.count = count;
+	_ctx.err = 0;
+	_ctx.is_root = (dfid->path.dentry == s->root.dentry);
+
+	out->size += sizeof(u32);	// Make room for count
+
+	err = iterate_dir(dfid->filp, &_ctx.ctx);
+	if (err)
+		return err;
+	if (_ctx.err)
+		return _ctx.err;
+
+	// Write the last element
+	if (_ctx.i)
+		p9pdu_writef(out, "Qqbs", &_ctx.prev.qid, (u64) _ctx.ctx.pos, _ctx.prev.d_type, _ctx.prev.name);
+
 	out->size = P9_PDU_HDR_LEN;
-	p9pdu_writef(out, "d", (u32) t);
-	out->size += t;
+	p9pdu_writef(out, "d", _ctx.i);	// Total bytes written
+	out->size += _ctx.i;
 
 	return 0;
 }
 
-static int p9_local_op_read(struct vhost_9p *dev, struct p9_fcall *in,
-							struct p9_fcall *out)
+static int p9_op_read(struct p9_server *s, struct p9_fcall *in,
+					  struct p9_fcall *out)
 {
 	u32 fid_val, count;
 	u64 offset;
 	ssize_t len;
-	struct p9_local_fid *fid;
+	struct p9_server_fid *fid;
 	mm_segment_t fs;
 
 	p9pdu_readf(in, "dqd", &fid_val, &offset, &count);
 
-	fid = find_fid(dev, fid_val);
+	fid = lookup_fid(s, fid_val);
 	if (IS_ERR(fid))
 		return PTR_ERR(fid);
+
+	if (IS_ERR_OR_NULL(fid->filp))
+		return -EBADF;
 
 	out->size += sizeof(u32);
 
@@ -553,20 +618,23 @@ static int p9_local_op_read(struct vhost_9p *dev, struct p9_fcall *in,
 	return 0;
 }
 
-static int p9_local_op_readv(struct vhost_9p *dev, struct p9_fcall *in,
-							struct p9_fcall *out, struct iov_iter *data)
+static int p9_op_readv(struct p9_server *s, struct p9_fcall *in,
+					   struct p9_fcall *out, struct iov_iter *data)
 {
 	u32 fid_val, count;
 	u64 offset;
 	ssize_t len;
-	struct p9_local_fid *fid;
+	struct p9_server_fid *fid;
 	mm_segment_t fs;
 
 	p9pdu_readf(in, "dqd", &fid_val, &offset, &count);
 
-	fid = find_fid(dev, fid_val);
+	fid = lookup_fid(s, fid_val);
 	if (IS_ERR(fid))
 		return PTR_ERR(fid);
+
+	if (IS_ERR_OR_NULL(fid->filp))
+		return -EBADF;
 
 	if (data->count > count)
 		data->count = count;
@@ -587,14 +655,13 @@ static int p9_local_op_readv(struct vhost_9p *dev, struct p9_fcall *in,
 
 #define ATTR_MASK	127
 
-static int p9_local_op_setattr(struct vhost_9p *dev, struct p9_fcall *in,
-							   struct p9_fcall *out)
+static int p9_op_setattr(struct p9_server *s, struct p9_fcall *in,
+						 struct p9_fcall *out)
 {
 	int err = 0; /* TODO: remove */
 	u32 fid_val;
-	struct p9_local_fid *fid;
+	struct p9_server_fid *fid;
 	struct p9_iattr_dotl p9attr;
-	mm_segment_t fs;
 
 	p9pdu_readf(in, "dddugqqqqq", &fid_val, 
 				&p9attr.valid, &p9attr.mode,
@@ -602,12 +669,12 @@ static int p9_local_op_setattr(struct vhost_9p *dev, struct p9_fcall *in,
 				&p9attr.atime_sec, &p9attr.atime_nsec,
 				&p9attr.mtime_sec, &p9attr.mtime_nsec);
 
-	fid = find_fid(dev, fid_val);
+	fid = lookup_fid(s, fid_val);
 	if (IS_ERR(fid))
 		return PTR_ERR(fid);
 /*
 	if (p9attr.valid & ATTR_MODE) {
-		err = chmod(fid->real_path, p9attr.mode);
+		err = chmod(fid->path, p9attr.mode);
 		if (err < 0)
 			return err;
 	}
@@ -633,7 +700,7 @@ static int p9_local_op_setattr(struct vhost_9p *dev, struct p9_fcall *in,
 		} else
 			times[1].tv_nsec = UTIME_OMIT;
 
-		err = utimensat(-1, fid->real_path, times, AT_SYMLINK_NOFOLLOW);
+		err = utimensat(-1, fid->path, times, AT_SYMLINK_NOFOLLOW);
 		if (err < 0)
 			return err;
 	}
@@ -650,17 +717,14 @@ static int p9_local_op_setattr(struct vhost_9p *dev, struct p9_fcall *in,
 		if (!(p9attr.valid & ATTR_GID))
 			p9attr.gid = KGIDT_INIT(-1);
 
-		err = lchown(fid->real_path, __kuid_val(p9attr.uid),
+		err = lchown(fid->path, __kuid_val(p9attr.uid),
 				__kgid_val(p9attr.gid));
 		if (err < 0)
 			return err;
 	}
 */
 	if (p9attr.valid & ATTR_SIZE) {
-		fs = get_fs();
-		set_fs(KERNEL_DS);
-		err = sys_truncate(fid->real_path, p9attr.size);
-		set_fs(fs);
+		err = vfs_truncate(&fid->path, p9attr.size);
 
 		if (err < 0)
 			return err;
@@ -669,20 +733,23 @@ static int p9_local_op_setattr(struct vhost_9p *dev, struct p9_fcall *in,
 	return 0;
 }
 
-static int p9_local_op_write(struct vhost_9p *dev, struct p9_fcall *in,
-							 struct p9_fcall *out)
+static int p9_op_write(struct p9_server *s, struct p9_fcall *in,
+					   struct p9_fcall *out)
 {
 	u64 offset;
 	u32 fid_val, count;
 	ssize_t len;
-	struct p9_local_fid *fid;
+	struct p9_server_fid *fid;
 	mm_segment_t fs;
 
 	p9pdu_readf(in, "dqd", &fid_val, &offset, &count);
 
-	fid = find_fid(dev, fid_val);
+	fid = lookup_fid(s, fid_val);
 	if (IS_ERR(fid))
 		return PTR_ERR(fid);
+
+	if (IS_ERR_OR_NULL(fid->filp))
+		return -EBADF;
 
 	fs = get_fs();
 	set_fs(KERNEL_DS);
@@ -696,28 +763,27 @@ static int p9_local_op_write(struct vhost_9p *dev, struct p9_fcall *in,
 	return 0;
 }
 
-static int p9_local_op_writev(struct vhost_9p *dev, struct p9_fcall *in,
-							 struct p9_fcall *out, struct iov_iter *data)
+static int p9_op_writev(struct p9_server *s, struct p9_fcall *in,
+						struct p9_fcall *out, struct iov_iter *data)
 {
 	u64 offset;
 	u32 fid_val, count;
 	ssize_t len;
-	struct p9_local_fid *fid;
-	mm_segment_t fs;
+	struct p9_server_fid *fid;
 
 	p9pdu_readf(in, "dqd", &fid_val, &offset, &count);
 
-	fid = find_fid(dev, fid_val);
+	fid = lookup_fid(s, fid_val);
 	if (IS_ERR(fid))
 		return PTR_ERR(fid);
+
+	if (IS_ERR_OR_NULL(fid->filp))
+		return -EBADF;
 
 	if (data->count > count)
 		data->count = count;
 
-	fs = get_fs();
-	set_fs(KERNEL_DS);
 	len = vfs_iter_write(fid->filp, data, &offset);
-	set_fs(fs);
 
 	if (len < 0)
 		return len;
@@ -726,223 +792,256 @@ static int p9_local_op_writev(struct vhost_9p *dev, struct p9_fcall *in,
 	return 0;
 }
 
-static int p9_local_op_remove(struct vhost_9p *dev, struct p9_fcall *in,
-							  struct p9_fcall *out)
+static int p9_op_remove(struct p9_server *s, struct p9_fcall *in,
+						struct p9_fcall *out)
 {
-	int err;
 	u32 fid_val;
-	struct kstat st;
-	struct p9_local_fid *fid;
-	mm_segment_t fs;
+	struct p9_server_fid *fid;
+	struct dentry *dentry;
 
 	p9pdu_readf(in, "d", &fid_val);
 
-	fid = find_fid(dev, fid_val);
+	fid = lookup_fid(s, fid_val);
 	if (IS_ERR(fid))
 		return PTR_ERR(fid);
 
-	err = lstat(fid->real_path, &st);
-	if (err < 0)
-		return err;
+	dentry = fid->path.dentry;
 
-	fs = get_fs();
-	set_fs(KERNEL_DS);
+	// TODO: null check
+	if (d_really_is_negative(dentry))
+		return -ENOENT;
 
-	if (S_ISDIR(st.mode))
-		err = sys_rmdir(fid->real_path);
+	if (S_ISDIR(dentry->d_inode->i_mode))
+		return vfs_rmdir(dentry->d_inode, dentry);
 	else
-		err = sys_unlink(fid->real_path);
-
-	set_fs(fs);
-
-	return err;
+		return vfs_unlink(dentry->d_parent->d_inode, dentry, NULL);
 }
 
-static int p9_local_op_rename(struct vhost_9p *dev, struct p9_fcall *in,
-							  struct p9_fcall *out)
+// TODO: resolve this hack
+extern int vfs_path_lookup(struct dentry *dentry, struct vfsmount *mnt,
+		    const char *name, unsigned int flags,
+		    struct path *path);
+
+static int p9_op_rename(struct p9_server *s, struct p9_fcall *in,
+						struct p9_fcall *out)
 {
 	int err;
 	u32 fid_val, newfid_val;
 	char *path;
-	struct p9_local_fid *fid, *newfid;
-	mm_segment_t fs;
+	struct p9_server_fid *fid, *newfid;
+	struct dentry *old_dentry, *new_dentry;
+	struct path new_path;
 
 	p9pdu_readf(in, "d", &fid_val);
-	fid = find_fid(dev, fid_val);
+
+	fid = lookup_fid(s, fid_val);
+
 	if (IS_ERR(fid))
 		return PTR_ERR(fid);
 
 	p9pdu_readf(in, "ds", &newfid_val, &path);
-	newfid = new_fid(dev, newfid_val, path);
+
+	err = vfs_path_lookup(fid->path.dentry, fid->path.mnt, path, LOOKUP_RENAME_TARGET, &new_path);
+	if (err < 0) {
+		kfree(path);
+		return err;
+	}
+
+	// TODO: security: new dir under the root
+
+	newfid = new_fid(s, newfid_val, &new_path);
+
 	kfree(path);
+
 	if (IS_ERR(newfid))
 		return PTR_ERR(newfid);
 
-	fs = get_fs();
-	set_fs(KERNEL_DS);
-	err = sys_rename(fid->real_path, newfid->real_path);
-	set_fs(fs);
+	old_dentry = fid->path.dentry;
+	new_dentry = newfid->path.dentry;
 
-	return err;
+	return vfs_rename(old_dentry->d_parent->d_inode, old_dentry,
+					  new_dentry->d_parent->d_inode, new_dentry,
+					  NULL, 0);
 }
-
-static int p9_local_op_mkdir(struct vhost_9p *dev, struct p9_fcall *in,
-							 struct p9_fcall *out)
+// TODO: gid
+static int p9_op_mkdir(struct p9_server *s, struct p9_fcall *in,
+					   struct p9_fcall *out)
 {
 	int err;
-	u32 fid_val, mode, gid;
-	char *name, *path;
+	u32 dfid_val, mode, gid;
+	char *name;
 	struct p9_qid qid;
-	struct p9_local_fid *fid;
-	mm_segment_t fs;
+	struct p9_server_fid *dfid;
+	struct path new_path;
 
-	p9pdu_readf(in, "d", &fid_val);
-	fid = find_fid(dev, fid_val);
-	if (IS_ERR(fid))
-		return PTR_ERR(fid);
+	p9pdu_readf(in, "d", &dfid_val);
+
+	dfid = lookup_fid(s, dfid_val);
+
+	if (IS_ERR(dfid))
+		return PTR_ERR(dfid);
 
 	p9pdu_readf(in, "sdd", &name, &mode, &gid);
-	path = kmalloc(PATH_MAX, GFP_KERNEL);
-	snprintf(path, PATH_MAX, "%s/%s", fid->real_path, name);
+
+	new_path.mnt = dfid->path.mnt;
+	new_path.dentry = lookup_one_len(name, dfid->path.dentry, strlen(name));
+
 	kfree(name);
 
-	fs = get_fs();
-	set_fs(KERNEL_DS);
-	err = sys_mkdir(path, mode);
-	set_fs(fs);
+	if (IS_ERR(new_path.dentry)) {
+		return PTR_ERR(new_path.dentry);
+	} else if (d_really_is_positive(new_path.dentry)) {
+		printk("GUOYK: mkdir: postive dentry!\n");
+		return -EEXIST;
+	}
 
+	// TODO: verify dfid's inode is valid
+
+	err = vfs_mkdir(dfid->path.dentry->d_inode, new_path.dentry, mode);
 	if (err < 0)
-		goto out;
-/*
-	err = chmod(path, mode & 0777);
-	if (err < 0)
-		goto out;
-*/
-	err = gen_qid(path, &qid, NULL);
+		return err;
+
+	err = gen_qid(&new_path, &qid, NULL);
 	if (err)
-		goto out;
+		return err;
+
+	dfid->path = new_path;
 
 	p9pdu_writef(out, "Qd", &qid, 0L);
 
-out:
-	kfree(path);
-	return err;
+	return 0;
 }
 
-static int p9_local_op_symlink(struct vhost_9p *dev, struct p9_fcall *in,
-							   struct p9_fcall *out)
+static int p9_op_symlink(struct p9_server *s, struct p9_fcall *in,
+						 struct p9_fcall *out)
 {
 	int err;
 	u32 fid_val, gid;
 	struct p9_qid qid;
-	struct p9_local_fid *fid;
-	char *name, *src, *symlink_path;
-	mm_segment_t fs;
-
-	p9pdu_readf(in, "d", &fid_val);
-	fid = find_fid(dev, fid_val);
-	if (IS_ERR(fid))
-		return PTR_ERR(fid);
-
-	p9pdu_readf(in, "ssd", &name, &src, &gid);
-	symlink_path = kmalloc(PATH_MAX, GFP_KERNEL);
-	snprintf(symlink_path, PATH_MAX, "%s/%s", fid->real_path, name);
-	kfree(name);
-
-	fs = get_fs();
-	set_fs(KERNEL_DS);
-	err = sys_symlink(src, symlink_path);
-	set_fs(fs);
-	kfree(src);
-
-	if (err < 0)
-		goto out;
-
-	err = gen_qid(symlink_path, &qid, NULL);
-	if (err)
-		goto out;
-
-	p9pdu_writef(out, "Q", &qid);
-out:
-	kfree(symlink_path);
-	return err;
-}
-
-static int p9_local_op_link(struct vhost_9p *dev, struct p9_fcall *in,
-							struct p9_fcall *out)
-{
-	int err;
-	u32 fid_val, dfid_val;
-	char *path, *name;
-	struct p9_local_fid *dfid, *fid;
-	mm_segment_t fs;
-
-	p9pdu_readf(in, "dd", &dfid_val, &fid_val);
-
-	fid = find_fid(dev, fid_val);
-	if (IS_ERR(fid))
-		return PTR_ERR(fid);
-
-	dfid = find_fid(dev, dfid_val);
-	if (IS_ERR(dfid))
-		return PTR_ERR(dfid);
-
-	p9pdu_readf(in, "s", &name);
-	path = kmalloc(PATH_MAX, GFP_KERNEL);
-	snprintf(path, PATH_MAX, "%s/%s", dfid->real_path, name);
-	kfree(name);
-
-	fs = get_fs();
-	set_fs(KERNEL_DS);
-	err = sys_link(fid->real_path, path);
-	set_fs(fs);
-
-	kfree(path);
-	return err;
-}
-
-static int p9_local_op_readlink(struct vhost_9p *dev, struct p9_fcall *in,
-								struct p9_fcall *out)
-{
-	int err;
-	u32 fid_val;
-	char *path;
-	struct p9_local_fid *fid;
-	mm_segment_t fs;
+	struct p9_server_fid *fid;
+	char *name, *dst;
+	struct path symlink_path;
 
 	p9pdu_readf(in, "d", &fid_val);
 
-	fid = find_fid(dev, fid_val);
+	fid = lookup_fid(s, fid_val);
+
 	if (IS_ERR(fid))
 		return PTR_ERR(fid);
 
-	path = kmalloc(PATH_MAX, GFP_KERNEL);
+	p9pdu_readf(in, "ssd", &name, &dst, &gid);
 
-	fs = get_fs();
-	set_fs(KERNEL_DS);
-	err = sys_readlink(fid->real_path, path, PATH_MAX);
-	set_fs(fs);
+	symlink_path.mnt = fid->path.mnt;
+	symlink_path.dentry = lookup_one_len(name, fid->path.dentry, strlen(name));
+	kfree(name);
+
+	if (d_really_is_positive(symlink_path.dentry)) {
+		kfree(dst);
+		return -EEXIST;
+	}
+
+	// TODO: security: symlink target must be strictly under the root
+
+	err = vfs_symlink(fid->path.dentry->d_inode, symlink_path.dentry, dst);
+
+	kfree(dst);
 
 	if (err < 0)
 		return err;
 
-	p9pdu_writef(out, "s", path);
-	kfree(path);
+	err = gen_qid(&symlink_path, &qid, NULL);
+	if (err)
+		return err;
+
+	p9pdu_writef(out, "Q", &qid);
+
 	return 0;
 }
 
-static int p9_local_op_fsync(struct vhost_9p *dev, struct p9_fcall *in,
-							 struct p9_fcall *out)
+static int p9_op_link(struct p9_server *s, struct p9_fcall *in,
+					  struct p9_fcall *out)
 {
-	int err = 0;
+	char *name;
+	u32 dfid_val, fid_val;
+	struct p9_server_fid *dfid, *fid;	// fid is the file to be hard-linked. dfid is the directory where the created hard link lies.
+	struct dentry *new_dentry;
+
+	p9pdu_readf(in, "dd", &dfid_val, &fid_val);
+
+	fid = lookup_fid(s, fid_val);
+
+	if (IS_ERR(fid))
+		return PTR_ERR(fid);
+
+	dfid = lookup_fid(s, dfid_val);
+
+	if (IS_ERR(dfid))
+		return PTR_ERR(dfid);
+
+	p9pdu_readf(in, "s", &name);
+
+	new_dentry = lookup_one_len(name, dfid->path.dentry, strlen(name));
+
+	kfree(name);
+
+	if (IS_ERR(new_dentry)) {
+		return PTR_ERR(new_dentry);
+	} else if (d_really_is_positive(new_dentry)) {
+		printk("GUOYK: link: postive dentry!\n");
+		return -EEXIST;
+	}
+
+	// TODO: make sure dfid dentry is positive
+
+	return vfs_link(fid->path.dentry, dfid->path.dentry->d_inode, new_dentry, NULL);
+}
+// TODO: put path
+static int p9_op_readlink(struct p9_server *s, struct p9_fcall *in,
+						  struct p9_fcall *out)
+{
+	int err;
+	char *path;
+	u32 fid_val;
+	struct p9_server_fid *fid;
+	struct dentry *dentry;
+	struct inode *inode;
+
+	p9pdu_readf(in, "d", &fid_val);
+
+	fid = lookup_fid(s, fid_val);
+
+	if (IS_ERR(fid))
+		return PTR_ERR(fid);
+
+	dentry = fid->path.dentry;
+	inode = d_backing_inode(dentry);
+	path = kmalloc(PATH_MAX, GFP_KERNEL);
+
+	// TODO: security check
+	err = inode->i_op->readlink(dentry, path, PATH_MAX);
+
+	if (!err)
+		p9pdu_writef(out, "s", path);
+
+	kfree(path);
+
+	return err;
+}
+
+static int p9_op_fsync(struct p9_server *s, struct p9_fcall *in,
+					   struct p9_fcall *out)
+{
+	int err = -EBADFD;
 	u32 fid_val, datasync;
-	struct p9_local_fid *fid;
+	struct p9_server_fid *fid;
 
 	p9pdu_readf(in, "dd", &fid_val, &datasync);
 
-	fid = find_fid(dev, fid_val);
+	fid = lookup_fid(s, fid_val);
 	if (IS_ERR(fid))
 		return PTR_ERR(fid);
+
+	// TODO: verify that filp can't be error
 
 	if (!IS_ERR_OR_NULL(fid->filp))
 		err = vfs_fsync(fid->filp, datasync);
@@ -950,50 +1049,56 @@ static int p9_local_op_fsync(struct vhost_9p *dev, struct p9_fcall *in,
 	return err;
 }
 
-static int p9_local_op_mknod(struct vhost_9p *dev, struct p9_fcall *in,
-							 struct p9_fcall *out)
+// TODO: gid
+static int p9_op_mknod(struct p9_server *s, struct p9_fcall *in,
+					   struct p9_fcall *out)
 {
 	int err;
-	u32 fid_val, mode, major, minor, gid;
-	char *name, *path;
+	char *name;
+	u32 dfid_val, mode, major, minor, gid;
 	struct p9_qid qid;
-	struct p9_local_fid *fid;
-	mm_segment_t fs;
+	struct p9_server_fid *dfid;
+	struct path new_path;
 
-	p9pdu_readf(in, "d", &fid_val);
-	fid = find_fid(dev, fid_val);
-	if (IS_ERR(fid))
-		return PTR_ERR(fid);
+	p9pdu_readf(in, "d", &dfid_val);
+
+	dfid = lookup_fid(s, dfid_val);
+
+	if (IS_ERR(dfid))
+		return PTR_ERR(dfid);
 
 	p9pdu_readf(in, "sdddd", &name, &mode, &major, &minor, &gid);
-	path = kmalloc(PATH_MAX, GFP_KERNEL);
-	snprintf(path, PATH_MAX, "%s/%s", fid->real_path, name);
+
+	new_path.mnt = dfid->path.mnt;
+	new_path.dentry = lookup_one_len(name, dfid->path.dentry, strlen(name));
+
 	kfree(name);
 
-	fs = get_fs();
-	set_fs(KERNEL_DS);
-	err = sys_mknod(path, mode, MKDEV(major, minor));
-	set_fs(fs);
+	if (IS_ERR(new_path.dentry)) {
+		return PTR_ERR(new_path.dentry);
+	} else if (d_really_is_positive(new_path.dentry)) {
+		printk("GUOYK: mknod: postive dentry!\n");
+		return -EEXIST;
+	}
+
+	err = vfs_mknod(dfid->path.dentry->d_inode, new_path.dentry, mode, MKDEV(major, minor));
 
 	if (err < 0)
-		goto out;
-/*
-	err = chmod(path, mode & 0777);
-	if (err < 0)
-		goto out;
-*/
-	err = gen_qid(path, &qid, NULL);
+		return err;
+
+	// TODO: need chmod?
+
+	err = gen_qid(&new_path, &qid, NULL);
 	if (err)
-		goto out;
+		return err;
 
 	p9pdu_writef(out, "Q", &qid);
-out:
-	kfree(path);
-	return err;
+
+	return 0;
 }
 
-static int p9_local_op_lock(struct vhost_9p *dev, struct p9_fcall *in,
-							struct p9_fcall *out)
+static int p9_op_lock(struct p9_server *s, struct p9_fcall *in,
+					  struct p9_fcall *out)
 {
 	u32 fid_val;
 	struct p9_flock flock;
@@ -1009,8 +1114,8 @@ static int p9_local_op_lock(struct vhost_9p *dev, struct p9_fcall *in,
 	return 0;
 }
 
-static int p9_local_op_getlock(struct vhost_9p *dev, struct p9_fcall *in,
-							   struct p9_fcall *out)
+static int p9_op_getlock(struct p9_server *s, struct p9_fcall *in,
+						 struct p9_fcall *out)
 {
 	u32 fid_val;
 	struct p9_getlock glock;
@@ -1029,106 +1134,8 @@ static int p9_local_op_getlock(struct vhost_9p *dev, struct p9_fcall *in,
 	return 0;
 }
 
-static int p9_local_op_unlinkat(struct vhost_9p *dev, struct p9_fcall *in,
-								struct p9_fcall *out)
-{
-	int err;
-	u32 fid_val, flags;
-	char *name, *path;
-	struct p9_local_fid *fid;
-	mm_segment_t fs;
-
-	p9pdu_readf(in, "d", &fid_val);
-	fid = find_fid(dev, fid_val);
-	if (IS_ERR(fid))
-		return PTR_ERR(fid);
-
-	p9pdu_readf(in, "sd", &name, &flags);
-	path = kmalloc(PATH_MAX, GFP_KERNEL);
-	snprintf(path, PATH_MAX, "%s/%s", fid->real_path, name);
-	kfree(name);
-
-	fs = get_fs();
-	set_fs(KERNEL_DS);
-	err = sys_unlinkat(AT_FDCWD, path, flags);
-	set_fs(fs);
-
-	kfree(path);
-	return err;
-}
-
-static void rename_fids(struct vhost_9p *dev, char *old_path, char *new_path)
-{
-	struct rb_node *node;
-	struct p9_local_fid *fid;
-	size_t len;
-	char *t;
-
-	t = kmalloc(PATH_MAX, GFP_KERNEL);
-	len = strlen(old_path);
-
-	for (node = rb_first(&dev->fids); node; node = rb_next(node)) {
-		fid = rb_entry(node, struct p9_local_fid, node);
-
-		if (fid->fid == P9_NOFID)
-			continue;
-
-		if (strncmp(fid->real_path, old_path, len) == 0 &&
-			(fid->real_path[len] == '/' || fid->real_path[len] == '\0')) {
-			strncpy(t, fid->real_path + len, PATH_MAX);
-			snprintf(fid->real_path, PATH_MAX, "%s/%s", new_path, t);
-		}
-	}
-
-	kfree(t);
-}
-
-static int p9_local_op_renameat(struct vhost_9p *dev, struct p9_fcall *in,
-								struct p9_fcall *out)
-{
-	int err;
-	u32 fid_val, newfid_val;
-	char *old_name, *new_name, *old_path, *new_path;
-	struct p9_local_fid *fid, *newfid;
-
-	p9pdu_readf(in, "dsds", &fid_val, &old_name,
-			    &newfid_val, &new_name);
-
-	fid = find_fid(dev, fid_val);
-	if (IS_ERR(fid)) {
-		err = PTR_ERR(fid);
-		goto out1;
-	}
-
-	newfid = find_fid(dev, newfid_val);
-	if (IS_ERR(newfid)) {
-		err = PTR_ERR(newfid);
-		goto out1;
-	}
-
-	old_path = kmalloc(PATH_MAX, GFP_KERNEL);
-	new_path = kmalloc(PATH_MAX, GFP_KERNEL);
-	snprintf(old_path, PATH_MAX, "%s/%s", fid->real_path, old_name);
-	snprintf(new_path, PATH_MAX, "%s/%s", newfid->real_path, new_name);
-
-	err = sys_renameat(AT_FDCWD, old_path, AT_FDCWD, new_path);
-	if (err < 0)
-		goto out2;
-
-	/* Now fix path in other fids, if the renamed path is part of that. */
-	rename_fids(dev, old_path, new_path);
-
-out2:
-	kfree(old_path);
-	kfree(new_path);
-out1:
-	kfree(old_name);
-	kfree(new_name);
-	return err;
-}
-
-static int p9_local_op_flush(struct vhost_9p *dev, struct p9_fcall *in,
-							 struct p9_fcall *out)
+static int p9_op_flush(struct p9_server *s, struct p9_fcall *in,
+					   struct p9_fcall *out)
 {
 	u16 tag, oldtag;
 
@@ -1138,44 +1145,44 @@ static int p9_local_op_flush(struct vhost_9p *dev, struct p9_fcall *in,
 	return 0;
 }
 
-typedef int p9_local_op(struct vhost_9p *dev, struct p9_fcall *in,
+typedef int p9_server_op(struct p9_server *s, struct p9_fcall *in,
 			struct p9_fcall *out);
 
-static p9_local_op *p9_local_ops [] = {
-//	[P9_TLERROR]      = p9_local_op_error,	// Not used
-	[P9_TSTATFS]      = p9_local_op_statfs,
-	[P9_TLOPEN]       = p9_local_op_open,
-	[P9_TLCREATE]     = p9_local_op_create,
-	[P9_TSYMLINK]     = p9_local_op_symlink,
-	[P9_TMKNOD]       = p9_local_op_mknod,
-	[P9_TRENAME]      = p9_local_op_rename,
-	[P9_TREADLINK]    = p9_local_op_readlink,
-	[P9_TGETATTR]     = p9_local_op_getattr,
-	[P9_TSETATTR]     = p9_local_op_setattr,
-//	[P9_TXATTRWALK]   = p9_local_op_xattrwalk,	// Not implemented
-//	[P9_TXATTRCREATE] = p9_local_op_xattrcreate,	// Not implemented
-	[P9_TREADDIR]     = p9_local_op_readdir,
-	[P9_TFSYNC]       = p9_local_op_fsync,
-	[P9_TLOCK]        = p9_local_op_lock,
-	[P9_TGETLOCK]     = p9_local_op_getlock,
-	[P9_TLINK]        = p9_local_op_link,
-	[P9_TMKDIR]       = p9_local_op_mkdir,
-	[P9_TRENAMEAT]    = p9_local_op_renameat,
-	[P9_TUNLINKAT]    = p9_local_op_unlinkat,
-	[P9_TVERSION]     = p9_local_op_version,
-//	[P9_TAUTH]        = p9_local_op_auth,	// Not implemented
-	[P9_TATTACH]      = p9_local_op_attach,
-//	[P9_TERROR]       = p9_local_op_error,		// Not used
-	[P9_TFLUSH]       = p9_local_op_flush,
-	[P9_TWALK]        = p9_local_op_walk,
-//	[P9_TOPEN]        = p9_local_op_open,	// Not supported in 9P2000.L
-//	[P9_TCREATE]      = p9_local_op_create,	// Not supported in 9P2000.L
-	[P9_TREAD]        = p9_local_op_read,
-	[P9_TWRITE]       = p9_local_op_write,
-	[P9_TCLUNK]       = p9_local_op_clunk,
-	[P9_TREMOVE]      = p9_local_op_remove,
-//	[P9_TSTAT]        = p9_local_op_stat,	// Not implemented
-//	[P9_TWSTAT]       = p9_local_op_wstat,	// Not implemented
+static p9_server_op *p9_ops [] = {
+//	[P9_TLERROR]      = p9_op_error,	// Not used
+	[P9_TSTATFS]      = p9_op_statfs,
+	[P9_TLOPEN]       = p9_op_open,
+	[P9_TLCREATE]     = p9_op_create,
+	[P9_TSYMLINK]     = p9_op_symlink,
+	[P9_TMKNOD]       = p9_op_mknod,
+	[P9_TRENAME]      = p9_op_rename,
+	[P9_TREADLINK]    = p9_op_readlink,
+	[P9_TGETATTR]     = p9_op_getattr,
+	[P9_TSETATTR]     = p9_op_setattr,
+//	[P9_TXATTRWALK]   = p9_op_xattrwalk,	// Not implemented
+//	[P9_TXATTRCREATE] = p9_op_xattrcreate,	// Not implemented
+	[P9_TREADDIR]     = p9_op_readdir,
+	[P9_TFSYNC]       = p9_op_fsync,
+	[P9_TLOCK]        = p9_op_lock,
+	[P9_TGETLOCK]     = p9_op_getlock,
+	[P9_TLINK]        = p9_op_link,
+	[P9_TMKDIR]       = p9_op_mkdir,
+//	[P9_TRENAMEAT]    = p9_op_renameat,	// Not supported. No easy way to implement besides syscalls
+//	[P9_TUNLINKAT]    = p9_op_unlinkat,	// Not supported. No easy way to implement besides syscalls
+	[P9_TVERSION]     = p9_op_version,
+//	[P9_TAUTH]        = p9_op_auth,	// Not implemented
+	[P9_TATTACH]      = p9_op_attach,
+//	[P9_TERROR]       = p9_op_error,		// Not used
+	[P9_TFLUSH]       = p9_op_flush,
+	[P9_TWALK]        = p9_op_walk,
+//	[P9_TOPEN]        = p9_op_open,	// Not supported in 9P2000.L
+//	[P9_TCREATE]      = p9_op_create,	// Not supported in 9P2000.L
+	[P9_TREAD]        = p9_op_read,
+	[P9_TWRITE]       = p9_op_write,
+	[P9_TCLUNK]       = p9_op_clunk,
+	[P9_TREMOVE]      = p9_op_remove,
+//	[P9_TSTAT]        = p9_op_stat,	// Not implemented
+//	[P9_TWSTAT]       = p9_op_wstat,	// Not implemented
 };
 
 static const char *translate [] = {
@@ -1254,72 +1261,64 @@ static size_t pdu_fill(struct p9_fcall *pdu, struct iov_iter *from, size_t size)
 	return size - ret;
 }
 
-/*
-Quirks for performance optimization
-1. copy size is io_header
-
- */
-
-void do_9p_request(struct vhost_9p *dev, struct iov_iter *req, struct iov_iter *resp)
+void do_9p_request(struct p9_server *s, struct iov_iter *req, struct iov_iter *resp)
 {
 	int err = -EOPNOTSUPP;
 	u8 cmd;
 	struct iov_iter data;
 	struct p9_fcall *in, *out;
-	struct p9_header *hdr;
-	struct p9_io_header *io_hdr;
+	struct p9_io_header *hdr;	// Assume the operation is an IO operation to save additional copy_from_iter.
 
 	in = new_pdu(req->count);
 	out = new_pdu(resp->count);
 
 	pdu_fill(in, req, sizeof(struct p9_io_header));
-	hdr = (struct p9_header *)in->sdata;
+	hdr = (struct p9_io_header *)in->sdata;
 
 	in->offset = out->size = sizeof(struct p9_header);
 	in->tag = out->tag = hdr->tag;
 	in->id = cmd = hdr->id;
 	out->id = hdr->id + 1;
 
-//	printk("GUOYK: do_9p_request: %s! %d\n", translate[cmd], in->tag);
+	printk("GUOYK: do_9p_request: %s! %d\n", translate[cmd], in->tag);
 
-	if (cmd < ARRAY_SIZE(p9_local_ops) && p9_local_ops[cmd]) {
+	if (cmd < ARRAY_SIZE(p9_ops) && p9_ops[cmd]) {
 		if (cmd == P9_TREAD || cmd == P9_TWRITE) {
-			io_hdr = (struct p9_io_header *) hdr;
-
 			/* Do zero-copy for large IO */
-			if (io_hdr->count > 1024) {
+			if (hdr->count > 1024) {
 				if (cmd == P9_TREAD) {
 					iov_iter_clone(&data, resp);
 					iov_iter_advance(&data, sizeof(struct p9_header) + sizeof(u32));
 					resp->count = sizeof(struct p9_header) + sizeof(u32);	// Hack
 
-					err = p9_local_op_readv(dev, in, out, &data);
+					err = p9_op_readv(s, in, out, &data);
 				} else
-					err = p9_local_op_writev(dev, in, out, req);
+					err = p9_op_writev(s, in, out, req);
 			} else {
 				if (cmd == P9_TWRITE) {
-					pdu_fill(in, req, io_hdr->count);
-					err = p9_local_op_write(dev, in, out);
+					pdu_fill(in, req, hdr->count);
+					err = p9_op_write(s, in, out);
 				} else
-					err = p9_local_op_read(dev, in, out);
+					err = p9_op_read(s, in, out);
 			}
 		} else {
 			/* Copy the rest data */
 			if (hdr->size > sizeof(struct p9_io_header))
 				pdu_fill(in, req, hdr->size - sizeof(struct p9_io_header));
 
-			err = p9_local_ops[cmd](dev, in, out);
+			err = p9_ops[cmd](s, in, out);
 		}
 
 		kfree(in);
 	} else {
-		if (cmd < ARRAY_SIZE(p9_local_ops))
+		if (cmd < ARRAY_SIZE(p9_ops))
 			printk("GUOYK: !!!not implemented: %s\n", translate[cmd]);
 		else
 			printk("GUOYK: !!!cmd too large: %d\n", (u32) cmd);
 	}
 
 	if (err) {
+printk("GUOYK: 9p request error: %d\n", err);
 		/* Compose an error reply */
 		out->size = 0;
 		p9pdu_writef(out, "dbwd", 
@@ -1336,34 +1335,24 @@ void do_9p_request(struct vhost_9p *dev, struct iov_iter *req, struct iov_iter *
 	kfree(out);
 }
 
-int p9_ops_init(struct vhost_9p *dev, const char *root_dir)
+struct p9_server *p9_server_create(struct path *root)
 {
-	int err;
-	struct kstat st;
-	size_t len;
+	struct p9_server *s;
 
-	printk("GUOYK: 9p local create! %s\n", root_dir);
+	printk("GUOYK: 9p server create!\n");
 
-	if (root_dir[0] != '/')
-		return -EINVAL;
+	s = kmalloc(sizeof(struct p9_server), GFP_KERNEL);
+	if (!s)
+		return ERR_PTR(-ENOMEM);
 
-	len = strlen(root_dir);
-	if (len > PATH_MAX - 1)
-		return -ENAMETOOLONG;
+	s->root = *root;
+	s->fids = RB_ROOT;
 
-	/* Check if base is dir */
-	err = lstat(root_dir, &st);
-	if (err)
-		return err;
+	return s;
+}
 
-	if (!S_ISDIR(st.mode))
-		return -ENOTDIR;
-
-	strncpy(dev->base, root_dir, len);
-	if (dev->base[len - 1] == '/')
-		dev->base[len - 1] = '\0';
-
-	dev->fids = RB_ROOT;
-
-	return 0;
+void p9_server_close(struct p9_server *s)
+{
+	if (!IS_ERR_OR_NULL(s))
+		kfree(s);
 }

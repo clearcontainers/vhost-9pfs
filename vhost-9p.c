@@ -9,6 +9,7 @@
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/namei.h>
 #include <linux/file.h>
 #include <linux/slab.h>
 
@@ -63,7 +64,7 @@ static void handle_vq(struct vhost_9p *n)
 		iov_iter_init(&req, WRITE, vq->iov, out, out_len);
 		iov_iter_init(&resp, READ, &vq->iov[out], in, in_len);
 
-		do_9p_request(n, &req, &resp);
+		do_9p_request(n->server, &req, &resp);
 
 		vhost_add_used_and_signal(&n->dev, vq, head, in + out);
 
@@ -88,11 +89,16 @@ static void handle_vq_kick(struct vhost_work *work)
 	handle_vq(n);
 }
 
+// TODO: execution flow review
 static int vhost_9p_open(struct inode *inode, struct file *f)
 {
 	struct vhost_dev *dev;
 	struct vhost_virtqueue **vqs;
 	struct vhost_9p *n = kmalloc(sizeof *n, GFP_KERNEL);
+	int err;
+	unsigned int lookup_flags = LOOKUP_FOLLOW;
+	char *str_root = "/home/guoyk/Desktop/vhost-9p/a";
+	struct path root;
 
 	printk("VHOST_9P_OPEN\n");
 
@@ -107,15 +113,26 @@ static int vhost_9p_open(struct inode *inode, struct file *f)
 
 	dev = &n->dev;
 
-	p9_ops_init(n, "/home/guoyk/Desktop/vhost-9p/a");
-
 	vqs[VHOST_9P_VQ] = &n->vqs[VHOST_9P_VQ];
 	n->vqs[VHOST_9P_VQ].handle_kick = handle_vq_kick;
 	vhost_dev_init(dev, vqs, VHOST_9P_VQ_MAX);
 
+retry:
+	err = kern_path(str_root, lookup_flags, &root);
+	if (!err) {
+		n->server = p9_server_create(&root);
+		if (IS_ERR(n->server))
+			err = PTR_ERR(n->server);
+	}
+
+	if (retry_estale(err, lookup_flags)) {
+		lookup_flags |= LOOKUP_REVAL;
+		goto retry;
+	}
+
 	f->private_data = n;
 
-	return 0;
+	return err;
 }
 
 static void *vhost_9p_stop_vq(struct vhost_9p *n,
@@ -203,7 +220,27 @@ static int vhost_9p_set_features(struct vhost_9p *n, u64 features)
 	mutex_unlock(&n->dev.mutex);
 	return 0;
 }
+/*
+	if (root_dir[0] != '/')
+		return -EINVAL;
 
+	len = strlen(root_dir);
+	if (len > PATH_MAX - 1)
+		return -ENAMETOOLONG;
+
+	// Check if base is dir
+	err = lstat(root_dir, &st);
+	if (err)
+		return err;
+
+	if (!S_ISDIR(st.mode))
+		return -ENOTDIR;
+
+	strncpy(s->base, root_dir, len);
+	if (s->base[len - 1] == '/')
+		s->base[len - 1] = '\0';
+
+*/
 static long vhost_9p_ioctl(struct file *f, unsigned int ioctl,
 			     unsigned long arg)
 {
