@@ -22,6 +22,7 @@
 /* Max number of bytes transferred before requeueing the job.
  * Using this limit prevents one virtqueue from starving others. */
 #define VHOST_9P_WEIGHT 0x80000
+#define VHOST_SET_PATH 3
 
 enum {
 	VHOST_9P_FEATURES = VHOST_FEATURES | (1ULL << VIRTIO_9P_MOUNT_TAG)
@@ -95,10 +96,6 @@ static int vhost_9p_open(struct inode *inode, struct file *f)
 	struct vhost_dev *dev;
 	struct vhost_virtqueue **vqs;
 	struct vhost_9p *n = kmalloc(sizeof *n, GFP_KERNEL);
-	int err;
-	unsigned int lookup_flags = LOOKUP_FOLLOW;
-	char *str_root = "/home/guoyk/Desktop/vhost-9p/a";
-	struct path root;
 
 	printk("VHOST_9P_OPEN\n");
 
@@ -117,22 +114,9 @@ static int vhost_9p_open(struct inode *inode, struct file *f)
 	n->vqs[VHOST_9P_VQ].handle_kick = handle_vq_kick;
 	vhost_dev_init(dev, vqs, VHOST_9P_VQ_MAX);
 
-retry:
-	err = kern_path(str_root, lookup_flags, &root);
-	if (!err) {
-		n->server = p9_server_create(&root);
-		if (IS_ERR(n->server))
-			err = PTR_ERR(n->server);
-	}
-
-	if (retry_estale(err, lookup_flags)) {
-		lookup_flags |= LOOKUP_REVAL;
-		goto retry;
-	}
-
 	f->private_data = n;
 
-	return err;
+	return 0;
 }
 
 static void *vhost_9p_stop_vq(struct vhost_9p *n,
@@ -241,6 +225,38 @@ static int vhost_9p_set_features(struct vhost_9p *n, u64 features)
 		s->base[len - 1] = '\0';
 
 */
+
+long vhost_9p_set_path(struct vhost_9p *n, void __user *argp)
+{
+	char __user *src = argp;
+	char dst[PATH_MAX];
+	size_t len;
+	int err;
+	unsigned int lookup_flags = LOOKUP_FOLLOW;
+	struct path root;
+
+	// TODO: improve srtlen(src)
+	if (copy_from_user(&dst, src, strnlen_user(src, PATH_MAX)))
+		return -EFAULT;
+	len = strlen(dst);
+	if (len > PATH_MAX - 1)
+		return -ENAMETOOLONG;
+	retry:
+		err = kern_path(dst, lookup_flags, &root);
+		if (!err) {
+			n->server = p9_server_create(&root);
+			if (IS_ERR(n->server))
+				err = PTR_ERR(n->server);
+		}
+
+		if (retry_estale(err, lookup_flags)) {
+			lookup_flags |= LOOKUP_REVAL;
+			goto retry;
+		}
+
+	return err;
+}
+
 static long vhost_9p_ioctl(struct file *f, unsigned int ioctl,
 			     unsigned long arg)
 {
@@ -266,6 +282,8 @@ static long vhost_9p_ioctl(struct file *f, unsigned int ioctl,
 		return vhost_9p_set_features(n, features);
 	case VHOST_RESET_OWNER:
 		return vhost_9p_reset_owner(n);
+	case VHOST_SET_PATH:
+		return vhost_9p_set_path(n, argp);
 	default:
 		mutex_lock(&n->dev.mutex);
 		r = vhost_dev_ioctl(&n->dev, ioctl, argp);
