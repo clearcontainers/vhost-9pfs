@@ -168,20 +168,20 @@ static long vhost_9p_reset_owner(struct vhost_9p *n)
 {
 	void *priv = NULL;
 	long err;
-	struct vhost_memory *memory;
+	struct vhost_umem *umem;
 
 	mutex_lock(&n->dev.mutex);
 	err = vhost_dev_check_owner(&n->dev);
 	if (err)
 		goto done;
-	memory = vhost_dev_reset_owner_prepare();
-	if (!memory) {
+	umem = vhost_dev_reset_owner_prepare();
+	if (!umem) {
 		err = -ENOMEM;
 		goto done;
 	}
 	vhost_9p_stop(n, &priv);
 	vhost_9p_flush(n);
-	vhost_dev_reset_owner(&n->dev, memory);
+	vhost_dev_reset_owner(&n->dev, umem);
 done:
 	mutex_unlock(&n->dev.mutex);
 	return err;
@@ -266,7 +266,7 @@ static long vhost_9p_ioctl(struct file *f, unsigned int ioctl,
 	u64 features;
 	int r;
 
-	printk("virtio-9p ioctl: %d, %lx\n", ioctl, arg);
+	//printk("virtio-9p ioctl: %d, %lx\n", ioctl, arg);
 
 	switch (ioctl) {
 	case VHOST_GET_FEATURES:
