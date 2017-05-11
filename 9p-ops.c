@@ -798,6 +798,7 @@ static int p9_op_remove(struct p9_server *s, struct p9_fcall *in,
 	u32 fid_val;
 	struct p9_server_fid *fid;
 	struct dentry *dentry;
+	int err;
 
 	p9pdu_readf(in, "d", &fid_val);
 
@@ -812,9 +813,12 @@ static int p9_op_remove(struct p9_server *s, struct p9_fcall *in,
 		return -ENOENT;
 
 	if (S_ISDIR(dentry->d_inode->i_mode))
-		return vfs_rmdir(dentry->d_inode, dentry);
+		err = vfs_rmdir(dentry->d_parent->d_inode, dentry);
 	else
-		return vfs_unlink(dentry->d_parent->d_inode, dentry, NULL);
+		err = vfs_unlink(dentry->d_parent->d_inode, dentry, NULL);
+
+	rb_erase(&fid->node, &s->fids);
+	return err;
 }
 
 // TODO: resolve this hack
