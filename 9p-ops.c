@@ -421,7 +421,7 @@ static int p9_op_create(struct p9_server *s, struct p9_fcall *in,
 	if (IS_ERR(new_path.dentry))
 		return PTR_ERR(new_path.dentry);
 	else if (d_really_is_positive(new_path.dentry)) {
-		printk("GUOYK: create: postive dentry!\n");
+		printk(KERN_NOTICE "create: postive dentry!\n");
 		return -EEXIST;
 	}
 
@@ -895,7 +895,7 @@ static int p9_op_mkdir(struct p9_server *s, struct p9_fcall *in,
 	if (IS_ERR(new_path.dentry)) {
 		return PTR_ERR(new_path.dentry);
 	} else if (d_really_is_positive(new_path.dentry)) {
-		printk("GUOYK: mkdir: postive dentry!\n");
+		printk(KERN_NOTICE "mkdir: postive dentry!\n");
 		return -EEXIST;
 	}
 
@@ -991,7 +991,7 @@ static int p9_op_link(struct p9_server *s, struct p9_fcall *in,
 	if (IS_ERR(new_dentry)) {
 		return PTR_ERR(new_dentry);
 	} else if (d_really_is_positive(new_dentry)) {
-		printk("GUOYK: link: postive dentry!\n");
+		printk(KERN_NOTICE "link: postive dentry!\n");
 		return -EEXIST;
 	}
 
@@ -1081,7 +1081,7 @@ static int p9_op_mknod(struct p9_server *s, struct p9_fcall *in,
 	if (IS_ERR(new_path.dentry)) {
 		return PTR_ERR(new_path.dentry);
 	} else if (d_really_is_positive(new_path.dentry)) {
-		printk("GUOYK: mknod: postive dentry!\n");
+		printk(KERN_NOTICE "mknod: postive dentry!\n");
 		return -EEXIST;
 	}
 
@@ -1284,7 +1284,7 @@ void do_9p_request(struct p9_server *s, struct iov_iter *req, struct iov_iter *r
 	in->id = cmd = hdr->id;
 	out->id = hdr->id + 1;
 
-	printk("GUOYK: do_9p_request: %s! %d\n", translate[cmd], in->tag);
+	printk(KERN_NOTICE "do_9p_request: %s! %d\n", translate[cmd], in->tag);
 
 	if (cmd < ARRAY_SIZE(p9_ops) && p9_ops[cmd]) {
 		if (cmd == P9_TREAD || cmd == P9_TWRITE) {
@@ -1316,13 +1316,13 @@ void do_9p_request(struct p9_server *s, struct iov_iter *req, struct iov_iter *r
 		kfree(in);
 	} else {
 		if (cmd < ARRAY_SIZE(p9_ops))
-			printk("GUOYK: !!!not implemented: %s\n", translate[cmd]);
+			printk(KERN_WARNING "!!!not implemented: %s\n", translate[cmd]);
 		else
-			printk("GUOYK: !!!cmd too large: %d\n", (u32) cmd);
+			printk(KERN_WARNING "!!!cmd too large: %d\n", (u32) cmd);
 	}
 
 	if (err) {
-printk("GUOYK: 9p request error: %d\n", err);
+		printk(KERN_ERR "9p request error: %d\n", err);
 		/* Compose an error reply */
 		out->size = 0;
 		p9pdu_writef(out, "dbwd", 
@@ -1343,7 +1343,7 @@ struct p9_server *p9_server_create(struct path *root)
 {
 	struct p9_server *s;
 
-	printk("GUOYK: 9p server create!\n");
+	printk(KERN_INFO "9p server create!\n");
 
 	s = kmalloc(sizeof(struct p9_server), GFP_KERNEL);
 	if (!s)

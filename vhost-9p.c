@@ -97,7 +97,7 @@ static int vhost_9p_open(struct inode *inode, struct file *f)
 	struct vhost_virtqueue **vqs;
 	struct vhost_9p *n = kmalloc(sizeof *n, GFP_KERNEL);
 
-	printk("VHOST_9P_OPEN\n");
+	printk(KERN_INFO "VHOST_9P_OPEN\n");
 
 	if (!n)
 		return -ENOMEM;
@@ -151,7 +151,7 @@ static int vhost_9p_release(struct inode *inode, struct file *f)
 	struct vhost_9p *n = f->private_data;
 	void *private;
 
-	printk("VHOST_9P_RELEASE\n");
+	printk(KERN_INFO "VHOST_9P_RELEASE\n");
 
 	vhost_9p_stop(n, &private);
 	vhost_9p_flush(n);
