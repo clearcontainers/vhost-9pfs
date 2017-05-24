@@ -69,6 +69,7 @@ static struct p9_server_fid *new_fid(struct p9_server *s, u32 fid_val,
 	struct p9_server_fid *fid;
 	struct rb_node **node = &(s->fids.rb_node), *parent = NULL;
 
+    p9s_debug("create fid : %d\n", fid_val);
 	while (*node) {
 		int result = fid_val - rb_entry(*node, struct p9_server_fid, node)->fid;
 
@@ -84,7 +85,6 @@ static struct p9_server_fid *new_fid(struct p9_server *s, u32 fid_val,
 	fid = kmalloc(sizeof(struct p9_server_fid), GFP_KERNEL);
 	if (!fid)
 		return ERR_PTR(-ENOMEM);
-
 	fid->fid = fid_val;
 	fid->uid = s->uid;
 	fid->filp = NULL;
@@ -92,6 +92,7 @@ static struct p9_server_fid *new_fid(struct p9_server *s, u32 fid_val,
 
 	rb_link_node(&fid->node, parent, node);
 	rb_insert_color(&fid->node, &s->fids);
+    p9s_debug("fid : %d created\n", fid_val);
 
 	return fid;
 }
@@ -214,7 +215,7 @@ static int p9_op_clunk(struct p9_server *s, struct p9_fcall *in,
 	struct p9_server_fid *fid;
 
 	p9pdu_readf(in, "d", &fid_val);
-
+    p9s_debug("destroy fid : %d\n", fid_val);
 	fid = lookup_fid(s, fid_val);
 	if (IS_ERR(fid))
 		return 0;
@@ -224,7 +225,7 @@ static int p9_op_clunk(struct p9_server *s, struct p9_fcall *in,
 
 	rb_erase(&fid->node, &s->fids);
 	kfree(fid);
-
+    p9s_debug("fid : %d destroyed\n ", fid_val);
 	return 0;
 }
 /*
