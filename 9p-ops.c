@@ -910,8 +910,6 @@ static int p9_op_mkdir(struct p9_server *s, struct p9_fcall *in,
 	if (err)
 		return err;
 
-	dfid->path = new_path;
-
 	p9pdu_writef(out, "Qd", &qid, 0L);
 
 	return 0;
