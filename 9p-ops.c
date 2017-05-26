@@ -1,5 +1,19 @@
 /*
- * The in-kernel 9p server
+ *	The in-kernel 9p server
+ *
+ *	Copyright (C) 2016 by Yuankai Guo <yuankai.guo@intel.com>
+ *	Copyright (C) 2017 by Anthony Xu <anthony.xu@intel.com>
+ *	Copyright (C) 2017 by Yu-chu Yang <yu-chu.yang@intel.com>
+ *
+ *	This program is free software; you can redistribute it and/or modify
+ *	it under the terms of the GNU General Public License version 2
+ *	as published by the Free Software Foundation.
+ *
+ *	This program is distributed in the hope that it will be useful,
+ *	but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *	GNU General Public License for more details.
+ *
  */
 
 #include <linux/fs.h>
@@ -27,13 +41,6 @@
 
 #define MAX_FILE_NAME 512
 const size_t P9_PDU_HDR_LEN = sizeof(u32) + sizeof(u8) + sizeof(u16);
-/*
-	TODO:
-		- Do not use syscalls
-		- Full support of setattr
-		- chmod
-		- Should have a lock to protect fids
-*/
 
 struct p9_server_fid {
 	u32 fid;
@@ -68,14 +75,15 @@ static struct p9_server_fid *lookup_fid(struct p9_server *s, u32 fid_val)
 }
 
 static struct p9_server_fid *new_fid(struct p9_server *s, u32 fid_val,
-									struct path *path)
+						struct path *path)
 {
 	struct p9_server_fid *fid;
 	struct rb_node **node = &(s->fids.rb_node), *parent = NULL;
 
-    p9s_debug("create fid : %d\n", fid_val);
+	p9s_debug("create fid : %d\n", fid_val);
 	while (*node) {
-		int result = fid_val - rb_entry(*node, struct p9_server_fid, node)->fid;
+		int result = fid_val
+			- rb_entry(*node, struct p9_server_fid, node)->fid;
 
 		parent = *node;
 		if (result < 0)
@@ -96,7 +104,7 @@ static struct p9_server_fid *new_fid(struct p9_server *s, u32 fid_val,
 
 	rb_link_node(&fid->node, parent, node);
 	rb_insert_color(&fid->node, &s->fids);
-    p9s_debug("fid : %d created\n", fid_val);
+	p9s_debug("fid : %d created\n", fid_val);
 
 	return fid;
 }
@@ -197,7 +205,8 @@ static int p9_op_getattr(struct p9_server *s, struct p9_fcall *in,
 	struct p9_qid qid;
 
 	p9pdu_readf(in, "dq", &fid_val, &request_mask);
-	p9s_debug("getattr : fid %d, request_mask %lld\n", fid_val, request_mask);
+	p9s_debug("getattr : fid %d,
+			request_mask %lld\n", fid_val, request_mask);
 
 	fid = lookup_fid(s, fid_val);
 	if (IS_ERR(fid))
@@ -225,7 +234,7 @@ static int p9_op_clunk(struct p9_server *s, struct p9_fcall *in,
 	struct p9_server_fid *fid;
 
 	p9pdu_readf(in, "d", &fid_val);
-    p9s_debug("destroy fid : %d\n", fid_val);
+	p9s_debug("destroy fid : %d\n", fid_val);
 	fid = lookup_fid(s, fid_val);
 	if (IS_ERR(fid))
 		return 0;
@@ -235,12 +244,10 @@ static int p9_op_clunk(struct p9_server *s, struct p9_fcall *in,
 
 	rb_erase(&fid->node, &s->fids);
 	kfree(fid);
-    p9s_debug("fid : %d destroyed \n", fid_val);
+	p9s_debug("fid : %d destroyed\n", fid_val);
 	return 0;
 }
-/*
-	http://man.cat-v.org/plan_9/5/walk
- */
+
 static int p9_op_walk(struct p9_server *s, struct p9_fcall *in,
 					  struct p9_fcall *out)
 {
@@ -248,7 +255,7 @@ static int p9_op_walk(struct p9_server *s, struct p9_fcall *in,
 	size_t t;
 	u16 nwqid, nwname;
 	u32 fid_val, newfid_val;
-	char * name;
+	char *name;
 	struct p9_qid qid;
 	struct p9_server_fid *fid, *newfid;
 	struct path new_path;
@@ -265,7 +272,8 @@ static int p9_op_walk(struct p9_server *s, struct p9_fcall *in,
 	if (!IS_ERR(newfid) && newfid_val != fid_val)
 		return -EEXIST;
 
-	p9s_debug("walk : fids %d,%d nwname %ud\n", fid_val, newfid_val, nwname);
+	p9s_debug("walk : fids %d,%d nwname %ud\n", fid_val,
+			newfid_val, nwname);
 
 	new_path = fid->path;
 	nwqid = 0;
@@ -277,11 +285,12 @@ static int p9_op_walk(struct p9_server *s, struct p9_fcall *in,
 			p9s_debug("walk : name %s\n", name);
 
 			/* ".." is not allowed. */
-			if (name[0] == '.' && name[1] == '.' && name[2] =='\0')
+			if (name[0] == '.' && name[1] == '.' && name[2] == '\0')
 				break;
 
 			// TODO: lock may be needed
-			new_path.dentry = lookup_one_len(name, fid->path.dentry, strlen(name));
+			new_path.dentry =
+			   lookup_one_len(name, fid->path.dentry, strlen(name));
 			kfree(name);
 
 			if (IS_ERR(new_path.dentry)) {
@@ -301,20 +310,21 @@ static int p9_op_walk(struct p9_server *s, struct p9_fcall *in,
 
 			p9pdu_writef(out, "Q", &qid);
 			p9s_debug("walk : qid = [%d] %x.%llx.%x\n",
-					nwqid, qid.type, (unsigned long long)qid.path, qid.version);
+					nwqid, qid.type, qid.path, qid.version);
 		}
 
 		if (!nwqid)
 			return err;
 	} else {
-		/* If nwname is 0, it's equivalent to walking to the current directory. */
+		/* If nwname is 0, it's equivalent to walking
+		 * to the current directory. */
 		err = gen_qid(&new_path, &qid, NULL);
 		if (err)
 			return err;
 
 		p9pdu_writef(out, "Q", &qid);
 		p9s_debug("walk : qid = %x.%llx.%x\n",
-				qid.type, (unsigned long long)qid.path, qid.version);
+				qid.type, qid.path, qid.version);
 	}
 
 	if (fid_val == newfid_val) {
@@ -359,8 +369,8 @@ static int p9_op_statfs(struct p9_server *s, struct p9_fcall *in,
 		(unsigned long long)st.f_fsid.val[1] << 32;
 
 	p9pdu_writef(out, "ddqqqqqqd", st.f_type,
-			     st.f_bsize, st.f_blocks, st.f_bfree, st.f_bavail,
-			     st.f_files, st.f_ffree, fsid, st.f_namelen);
+			 st.f_bsize, st.f_blocks, st.f_bfree, st.f_bavail,
+			 st.f_files, st.f_ffree, fsid, st.f_namelen);
 
 	return 0;
 }
@@ -392,7 +402,8 @@ static int p9_op_open(struct p9_server *s, struct p9_fcall *in,
 
 	if (IS_ERR(fid))
 		return PTR_ERR(fid);
-	else if (fid->filp)	// TODO: verify if being error is also considered busy
+	else if (fid->filp)
+		// TODO: verify if being error is also considered busy
 		return -EBUSY;
 
 	err = gen_qid(&fid->path, &qid, NULL);
@@ -400,8 +411,8 @@ static int p9_op_open(struct p9_server *s, struct p9_fcall *in,
 	if (err)
 		return err;
 
-	fid->filp = dentry_open(&fid->path, build_openflags(flags), current_cred());
-
+	fid->filp =
+		dentry_open(&fid->path, build_openflags(flags), current_cred());
 	if (IS_ERR(fid->filp)) {
 		fid->filp = NULL;
 		return PTR_ERR(fid->filp);
@@ -447,16 +458,17 @@ static int p9_op_create(struct p9_server *s, struct p9_fcall *in,
 	if (IS_ERR(new_path.dentry))
 		return PTR_ERR(new_path.dentry);
 	else if (d_really_is_positive(new_path.dentry)) {
-		printk(KERN_NOTICE "create: postive dentry!\n");
+		pr_notice("create: postive dentry!\n");
 		return -EEXIST;
 	}
 
-	err = vfs_create(dfid->path.dentry->d_inode, new_path.dentry, 
+	err = vfs_create(dfid->path.dentry->d_inode, new_path.dentry,
 					 mode, build_openflags(flags) & O_EXCL);
 	if (err)
 		return err;
 
-	new_filp = dentry_open(&new_path, build_openflags(flags) | O_CREAT, current_cred());
+	new_filp = dentry_open(&new_path,
+		build_openflags(flags) | O_CREAT, current_cred());
 	if (IS_ERR(new_filp))
 		return PTR_ERR(new_filp);
 
@@ -504,49 +516,54 @@ struct p9_readdir_ctx {
  */
 
 static int p9_readdir_cb(struct dir_context *ctx, const char *name, int namlen,
-						 loff_t offset, u64 ino, unsigned int d_type)
+		loff_t offset, u64 ino, unsigned int d_type)
 {
 	size_t write_len;
 	struct path path;
-	struct p9_readdir_ctx *_ctx = container_of(ctx, struct p9_readdir_ctx, ctx);
+	struct p9_readdir_ctx *_ctx =
+		container_of(ctx, struct p9_readdir_ctx, ctx);
 
+	write_len = sizeof(u8) +	// qid.type
+				sizeof(u32) +	// qid.version
+				sizeof(u64) +	// qid.path
+				sizeof(u64) +	// offset
+				sizeof(u8) +	// d_type
+				sizeof(u16) +	// name.len
+				namlen;					// name
 
-    write_len = sizeof(u8) +        // qid.type. Not using sizeof(struct p9_qid) because of the siz
-                sizeof(u32) +   // qid.version
-                sizeof(u64) +   // qid.path
-                sizeof(u64) +   // offset
-                sizeof(u8) +    // d_type
-                sizeof(u16) +   // name.len
-                namlen;                 // name
-
-    if (namlen >= MAX_FILE_NAME) {
-		printk(KERN_ERR "max file name is %d, this file name is %d\n",
-                MAX_FILE_NAME - 1, namlen);
-        return 1;
-    }
-	// If writting this dirent would cause an overflow, terminate iterate_dir.
+	if (namlen >= MAX_FILE_NAME) {
+		pr_err("max file name is %d, this file name is %d\n",
+				MAX_FILE_NAME - 1, namlen);
+		return 1;
+	}
+	// If writing this dirent would cause an overflow,
+	// terminate iterate_dir.
 	if (_ctx->i + write_len > _ctx->count)
 		return 1;
 
-	// Writting the previous element with current offset
+	// Writing the previous element with current offset
 	if (_ctx->i) {
-        p9s_debug("readdir_cb: offset %lld  d_type %d  name %s\n",
-                    offset, _ctx->prev.d_type, _ctx->prev.name);
-		p9pdu_writef(_ctx->out, "Qqbs", &_ctx->prev.qid, (u64) offset, _ctx->prev.d_type, _ctx->prev.name);
-    }
+		p9s_debug("readdir_cb: offset %lld	d_type %d  name %s\n",
+			offset, _ctx->prev.d_type, _ctx->prev.name);
+		p9pdu_writef(_ctx->out, "Qqbs", &_ctx->prev.qid, (u64) offset,
+			_ctx->prev.d_type, _ctx->prev.name);
+	}
 
 	/* Prepare the dirent for the next iteration. */
 
 	path.mnt = _ctx->parent->mnt;
 
-	// lookup_one_len doesn't allow the lookup of "." and "..". We have to do it ourselves.
+	// lookup_one_len doesn't allow the lookup of "." and "..".i
+	// We have to do it ourselves.
 	if (namlen == 1 && name[0] == '.')
 		path.dentry = _ctx->parent->dentry;
 	else if (namlen == 2 && name[0] == '.' && name[1] == '.')
 		// No ".." allowed on the mount root
-		path.dentry = _ctx->is_root ? _ctx->parent->dentry : _ctx->parent->dentry->d_parent;
+		path.dentry = _ctx->is_root ?
+			_ctx->parent->dentry : _ctx->parent->dentry->d_parent;
 	else
-		path.dentry = lookup_one_len(name, _ctx->parent->dentry, namlen);
+		path.dentry =
+			lookup_one_len(name, _ctx->parent->dentry, namlen);
 
 	if (IS_ERR(path.dentry)) {
 		_ctx->err = PTR_ERR(path.dentry);
@@ -560,8 +577,8 @@ static int p9_readdir_cb(struct dir_context *ctx, const char *name, int namlen,
 	if (_ctx->err)
 		goto out;
 
-    strncpy(_ctx->prev.name, name, namlen);
-    _ctx->prev.name[namlen] = 0;
+	strncpy(_ctx->prev.name, name, namlen);
+	_ctx->prev.name[namlen] = 0;
 	_ctx->prev.d_type = d_type;
 
 	_ctx->i += write_len;
@@ -612,10 +629,11 @@ static int p9_op_readdir(struct p9_server *s, struct p9_fcall *in,
 
 	// Write the last element
 	if (_ctx.i)
-		p9pdu_writef(out, "Qqbs", &_ctx.prev.qid, (u64) _ctx.ctx.pos, _ctx.prev.d_type, _ctx.prev.name);
+		p9pdu_writef(out, "Qqbs", &_ctx.prev.qid, (u64) _ctx.ctx.pos,
+				_ctx.prev.d_type, _ctx.prev.name);
 
 	out->size = P9_PDU_HDR_LEN;
-	p9pdu_writef(out, "d", _ctx.i);	// Total bytes written
+	p9pdu_writef(out, "d", _ctx.i); // Total bytes written
 	out->size += _ctx.i;
 
 	return 0;
@@ -662,7 +680,7 @@ static int p9_op_read(struct p9_server *s, struct p9_fcall *in,
 }
 
 static int p9_op_readv(struct p9_server *s, struct p9_fcall *in,
-					   struct p9_fcall *out, struct iov_iter *data)
+			struct p9_fcall *out, struct iov_iter *data)
 {
 	u32 fid_val, count;
 	u64 offset;
@@ -706,7 +724,7 @@ static int p9_op_setattr(struct p9_server *s, struct p9_fcall *in,
 	struct p9_server_fid *fid;
 	struct p9_iattr_dotl p9attr;
 
-	p9pdu_readf(in, "dddugqqqqq", &fid_val, 
+	p9pdu_readf(in, "dddugqqqqq", &fid_val,
 				&p9attr.valid, &p9attr.mode,
 				&p9attr.uid, &p9attr.gid, &p9attr.size,
 				&p9attr.atime_sec, &p9attr.atime_nsec,
@@ -753,8 +771,8 @@ static int p9_op_setattr(struct p9_server *s, struct p9_fcall *in,
 	 * chown(-1,-1) to update the ctime of the file
 	 */
 /*	if ((p9attr.valid & (ATTR_UID | ATTR_GID)) ||
-	    ((p9attr.valid & ATTR_CTIME)
-	     && !((p9attr.valid & ATTR_MASK) & ~ATTR_CTIME))) {
+		((p9attr.valid & ATTR_CTIME)
+		 && !((p9attr.valid & ATTR_MASK) & ~ATTR_CTIME))) {
 		if (!(p9attr.valid & ATTR_UID))
 			p9attr.uid = KUIDT_INIT(-1);
 
@@ -812,7 +830,7 @@ static int p9_op_write(struct p9_server *s, struct p9_fcall *in,
 }
 
 static int p9_op_writev(struct p9_server *s, struct p9_fcall *in,
-						struct p9_fcall *out, struct iov_iter *data)
+				struct p9_fcall *out, struct iov_iter *data)
 {
 	u64 offset;
 	u32 fid_val, count;
@@ -873,8 +891,8 @@ static int p9_op_remove(struct p9_server *s, struct p9_fcall *in,
 
 // TODO: resolve this hack
 extern int vfs_path_lookup(struct dentry *dentry, struct vfsmount *mnt,
-		    const char *name, unsigned int flags,
-		    struct path *path);
+			const char *name, unsigned int flags,
+			struct path *path);
 
 static int p9_op_rename(struct p9_server *s, struct p9_fcall *in,
 						struct p9_fcall *out)
@@ -896,7 +914,8 @@ static int p9_op_rename(struct p9_server *s, struct p9_fcall *in,
 	p9pdu_readf(in, "ds", &newfid_val, &path);
 	p9s_debug("rename : fid %d newfid %d\n", fid_val, newfid_val);
 
-	err = vfs_path_lookup(fid->path.dentry, fid->path.mnt, path, LOOKUP_RENAME_TARGET, &new_path);
+	err = vfs_path_lookup(fid->path.dentry, fid->path.mnt, path,
+		LOOKUP_RENAME_TARGET, &new_path);
 	if (err < 0) {
 		kfree(path);
 		return err;
@@ -916,8 +935,7 @@ static int p9_op_rename(struct p9_server *s, struct p9_fcall *in,
 	new_dentry = newfid->path.dentry;
 
 	return vfs_rename(old_dentry->d_parent->d_inode, old_dentry,
-					  new_dentry->d_parent->d_inode, new_dentry,
-					  NULL, 0);
+		new_dentry->d_parent->d_inode, new_dentry, NULL, 0);
 }
 
 static int p9_op_renameat(struct p9_server *s, struct p9_fcall *in,
@@ -925,7 +943,7 @@ static int p9_op_renameat(struct p9_server *s, struct p9_fcall *in,
 {
 	int err = 0;
 	u32 oldfid_val, newfid_val;
-    char *oldname = NULL, *newname = NULL;
+	char *oldname = NULL, *newname = NULL;
 	struct p9_server_fid *oldfid, *newfid;
 	struct dentry *old_dentry, *new_dentry;
 
@@ -933,49 +951,49 @@ static int p9_op_renameat(struct p9_server *s, struct p9_fcall *in,
 
 	oldfid = lookup_fid(s, oldfid_val);
 	if (IS_ERR(oldfid)) {
-        err = PTR_ERR(oldfid);
-        goto out;
-    }
+		err = PTR_ERR(oldfid);
+		goto out;
+	}
 
-    newfid = lookup_fid(s, newfid_val);
+	newfid = lookup_fid(s, newfid_val);
 	if (IS_ERR(newfid)) {
-        err = PTR_ERR(newfid);
-        goto out;
-    }
+		err = PTR_ERR(newfid);
+		goto out;
+	}
 
 	p9s_debug("renameat: oldfid %d, oldname %s, newfid %d, newname %s\n",
-            oldfid_val, oldname, newfid_val, newname );
+			oldfid_val, oldname, newfid_val, newname);
 
-    old_dentry = lookup_one_len(oldname, oldfid->path.dentry,
-                     strlen(oldname));
-    if (IS_ERR(old_dentry)) {
-        err = PTR_ERR(old_dentry);
-        goto out;
-    } else if (!d_really_is_positive(old_dentry)) {
-        pr_err("renameat: source file %s doesn't exist!\n", oldname);
-        err = -ENOENT;
-        goto out;
-    }
+	old_dentry = lookup_one_len(oldname, oldfid->path.dentry,
+					 strlen(oldname));
+	if (IS_ERR(old_dentry)) {
+		err = PTR_ERR(old_dentry);
+		goto out;
+	} else if (!d_really_is_positive(old_dentry)) {
+		pr_err("renameat: source file %s doesn't exist!\n", oldname);
+		err = -ENOENT;
+		goto out;
+	}
 
-    new_dentry = lookup_one_len(newname, newfid->path.dentry,
-                     strlen(newname));
-    if (IS_ERR(new_dentry)) {
-        err = PTR_ERR(new_dentry);
-        goto out;
-    } else if (d_really_is_positive(new_dentry)) {
-        pr_err("renameat: destiny file %s exists!\n", newname);
-        err = -EEXIST;
-        goto out;
-    }
+	new_dentry = lookup_one_len(newname, newfid->path.dentry,
+					 strlen(newname));
+	if (IS_ERR(new_dentry)) {
+		err = PTR_ERR(new_dentry);
+		goto out;
+	} else if (d_really_is_positive(new_dentry)) {
+		pr_err("renameat: destiny file %s exists!\n", newname);
+		err = -EEXIST;
+		goto out;
+	}
 	p9s_debug("renameat: call vfs_rename\n");
 
 	err = vfs_rename(old_dentry->d_parent->d_inode, old_dentry,
-					  new_dentry->d_parent->d_inode, new_dentry,
-					  NULL, 0);
+				new_dentry->d_parent->d_inode, new_dentry,
+				NULL, 0);
 out:
-    kfree(oldname);
-    kfree(newname);
-    return err;
+	kfree(oldname);
+	kfree(newname);
+	return err;
 }
 
 static int p9_op_mkdir(struct p9_server *s, struct p9_fcall *in,
@@ -996,7 +1014,8 @@ static int p9_op_mkdir(struct p9_server *s, struct p9_fcall *in,
 		return PTR_ERR(dfid);
 
 	p9pdu_readf(in, "sdd", &name, &mode, &gid);
-	p9s_debug("mkdir : fid %d name %s mode %d gid %d\n", dfid->fid, name, mode, gid);
+	p9s_debug("mkdir : fid %d name %s mode %d gid %d\n",
+			dfid->fid, name, mode, gid);
 
 	new_path.mnt = dfid->path.mnt;
 	new_path.dentry = lookup_one_len(name, dfid->path.dentry, strlen(name));
@@ -1049,7 +1068,8 @@ static int p9_op_symlink(struct p9_server *s, struct p9_fcall *in,
 	p9s_debug("symlink : name %s  dst %s\n", name, dst);
 
 	symlink_path.mnt = fid->path.mnt;
-	symlink_path.dentry = lookup_one_len(name, fid->path.dentry, strlen(name));
+	symlink_path.dentry =
+		lookup_one_len(name, fid->path.dentry, strlen(name));
 	kfree(name);
 
 	if (d_really_is_positive(symlink_path.dentry)) {
@@ -1082,7 +1102,7 @@ static int p9_op_link(struct p9_server *s, struct p9_fcall *in,
 {
 	char *name;
 	u32 dfid_val, fid_val;
-	struct p9_server_fid *dfid, *fid;	// fid is the file to be hard-linked. dfid is the directory where the created hard link lies.
+	struct p9_server_fid *dfid, *fid;
 	struct dentry *new_dentry;
 
 	p9pdu_readf(in, "dd", &dfid_val, &fid_val);
@@ -1108,13 +1128,14 @@ static int p9_op_link(struct p9_server *s, struct p9_fcall *in,
 	if (IS_ERR(new_dentry)) {
 		return PTR_ERR(new_dentry);
 	} else if (d_really_is_positive(new_dentry)) {
-		printk(KERN_NOTICE "link: postive dentry!\n");
+		pr_notice("link: postive dentry!\n");
 		return -EEXIST;
 	}
 
 	// TODO: make sure dfid dentry is positive
 
-	return vfs_link(fid->path.dentry, dfid->path.dentry->d_inode, new_dentry, NULL);
+	return vfs_link(fid->path.dentry, dfid->path.dentry->d_inode,
+			new_dentry, NULL);
 }
 // TODO: put path
 static int p9_op_readlink(struct p9_server *s, struct p9_fcall *in,
@@ -1123,8 +1144,8 @@ static int p9_op_readlink(struct p9_server *s, struct p9_fcall *in,
 	u32 fid_val;
 	struct p9_server_fid *fid;
 	struct dentry *dentry;
-    const char *link = NULL;
-    DEFINE_DELAYED_CALL(done);
+	const char *link = NULL;
+	DEFINE_DELAYED_CALL(done);
 
 	p9pdu_readf(in, "d", &fid_val);
 	p9s_debug("readlink : fid %d\n", fid_val);
@@ -1136,9 +1157,9 @@ static int p9_op_readlink(struct p9_server *s, struct p9_fcall *in,
 	dentry = fid->path.dentry;
 
 	// TODO: security check
-    link = vfs_get_link(dentry, &done);
-    if (IS_ERR(link))
-        return PTR_ERR(link);
+	link = vfs_get_link(dentry, &done);
+	if (IS_ERR(link))
+		return PTR_ERR(link);
 
 	p9pdu_writef(out, "s", link);
 
@@ -1190,7 +1211,8 @@ static int p9_op_mknod(struct p9_server *s, struct p9_fcall *in,
 		return PTR_ERR(dfid);
 
 	p9pdu_readf(in, "sdddd", &name, &mode, &major, &minor, &gid);
-	p9s_debug("mknod : name %s mode %d major %d minor %d\n", name, mode, major, minor);
+	p9s_debug("mknod : name %s mode %d major %d minor %d\n",
+		name, mode, major, minor);
 
 	new_path.mnt = dfid->path.mnt;
 	new_path.dentry = lookup_one_len(name, dfid->path.dentry, strlen(name));
@@ -1200,11 +1222,12 @@ static int p9_op_mknod(struct p9_server *s, struct p9_fcall *in,
 	if (IS_ERR(new_path.dentry)) {
 		return PTR_ERR(new_path.dentry);
 	} else if (d_really_is_positive(new_path.dentry)) {
-		printk(KERN_NOTICE "mknod: postive dentry!\n");
+		pr_notice("mknod: postive dentry!\n");
 		return -EEXIST;
 	}
 
-	err = vfs_mknod(dfid->path.dentry->d_inode, new_path.dentry, mode, MKDEV(major, minor));
+	err = vfs_mknod(dfid->path.dentry->d_inode, new_path.dentry,
+			mode, MKDEV(major, minor));
 
 	if (err < 0)
 		return err;
@@ -1229,10 +1252,10 @@ static int p9_op_lock(struct p9_server *s, struct p9_fcall *in,
 	struct p9_flock flock;
 
 	p9pdu_readf(in, "dbdqqds", &fid_val, &flock.type,
-			    &flock.flags, &flock.start, &flock.length,
-			    &flock.proc_id, &flock.client_id);
-	p9s_debug("lock : fid %d type %i flags %d "
-			"start %lld length %lld proc_id %d client_id %s\n",
+				&flock.flags, &flock.start, &flock.length,
+				&flock.proc_id, &flock.client_id);
+	p9s_debug("lock : fid %d type %i flags %d,
+			start %lld length %lld proc_id %d client_id %s\n",
 			fid_val, flock.type, flock.flags, flock.start,
 			flock.length, flock.proc_id, flock.client_id);
 
@@ -1252,8 +1275,8 @@ static int p9_op_getlock(struct p9_server *s, struct p9_fcall *in,
 	p9pdu_readf(in, "dbqqds", &fid_val, &glock.type,
 				&glock.start, &glock.length, &glock.proc_id,
 				&glock.client_id);
-	p9s_debug("getlock : fid %d, type %i start %lld "
-		"length %lld proc_id %d client_id %s\n", fid_val, glock.type,
+	p9s_debug("getlock : fid %d, type %i start %lld,
+		length %lld proc_id %d client_id %s\n", fid_val, glock.type,
 		glock.start, glock.length, glock.proc_id, glock.client_id);
 
 	/* Just return success */
@@ -1261,8 +1284,8 @@ static int p9_op_getlock(struct p9_server *s, struct p9_fcall *in,
 	p9pdu_writef(out, "bqqds", glock.type,
 				 glock.start, glock.length, glock.proc_id,
 				 glock.client_id);
-	p9s_debug("getlock : type %i start %lld "
-		"length %lld proc_id %d client_id %s\n", glock.type,
+	p9s_debug("getlock : type %i start %lld,
+		length %lld proc_id %d client_id %s\n", glock.type,
 		glock.start, glock.length, glock.proc_id, glock.client_id);
 
 	kfree(glock.client_id);
@@ -1284,85 +1307,86 @@ static int p9_op_flush(struct p9_server *s, struct p9_fcall *in,
 typedef int p9_server_op(struct p9_server *s, struct p9_fcall *in,
 			struct p9_fcall *out);
 
-static p9_server_op *p9_ops [] = {
-//	[P9_TLERROR]      = p9_op_error,	// Not used
-	[P9_TSTATFS]      = p9_op_statfs,
-	[P9_TLOPEN]       = p9_op_open,
-	[P9_TLCREATE]     = p9_op_create,
-	[P9_TSYMLINK]     = p9_op_symlink,
-	[P9_TMKNOD]       = p9_op_mknod,
-	[P9_TRENAME]      = p9_op_rename,
-	[P9_TREADLINK]    = p9_op_readlink,
-	[P9_TGETATTR]     = p9_op_getattr,
-	[P9_TSETATTR]     = p9_op_setattr,
+static p9_server_op *p9_ops[] = {
+//	[P9_TLERROR]	  = p9_op_error,	// Not used
+	[P9_TSTATFS]	  = p9_op_statfs,
+	[P9_TLOPEN]		  = p9_op_open,
+	[P9_TLCREATE]	  = p9_op_create,
+	[P9_TSYMLINK]	  = p9_op_symlink,
+	[P9_TMKNOD]		  = p9_op_mknod,
+	[P9_TRENAME]	  = p9_op_rename,
+	[P9_TREADLINK]	  = p9_op_readlink,
+	[P9_TGETATTR]	  = p9_op_getattr,
+	[P9_TSETATTR]	  = p9_op_setattr,
 //	[P9_TXATTRWALK]   = p9_op_xattrwalk,	// Not implemented
 //	[P9_TXATTRCREATE] = p9_op_xattrcreate,	// Not implemented
-	[P9_TREADDIR]     = p9_op_readdir,
-	[P9_TFSYNC]       = p9_op_fsync,
-	[P9_TLOCK]        = p9_op_lock,
-	[P9_TGETLOCK]     = p9_op_getlock,
-	[P9_TLINK]        = p9_op_link,
-	[P9_TMKDIR]       = p9_op_mkdir,
-	[P9_TRENAMEAT]    = p9_op_renameat,
-//	[P9_TUNLINKAT]    = p9_op_unlinkat,	// Not supported. No easy way to implement besides syscalls
-	[P9_TVERSION]     = p9_op_version,
-//	[P9_TAUTH]        = p9_op_auth,	// Not implemented
-	[P9_TATTACH]      = p9_op_attach,
-//	[P9_TERROR]       = p9_op_error,		// Not used
-	[P9_TFLUSH]       = p9_op_flush,
-	[P9_TWALK]        = p9_op_walk,
-//	[P9_TOPEN]        = p9_op_open,	// Not supported in 9P2000.L
-//	[P9_TCREATE]      = p9_op_create,	// Not supported in 9P2000.L
-	[P9_TREAD]        = p9_op_read,
-	[P9_TWRITE]       = p9_op_write,
-	[P9_TCLUNK]       = p9_op_clunk,
-	[P9_TREMOVE]      = p9_op_remove,
-//	[P9_TSTAT]        = p9_op_stat,	// Not implemented
-//	[P9_TWSTAT]       = p9_op_wstat,	// Not implemented
+	[P9_TREADDIR]	  = p9_op_readdir,
+	[P9_TFSYNC]		  = p9_op_fsync,
+	[P9_TLOCK]		  = p9_op_lock,
+	[P9_TGETLOCK]	  = p9_op_getlock,
+	[P9_TLINK]		  = p9_op_link,
+	[P9_TMKDIR]		  = p9_op_mkdir,
+	[P9_TRENAMEAT]	  = p9_op_renameat,
+//	[P9_TUNLINKAT]	  = p9_op_unlinkat,
+//Not supported. No easy way to implement besides syscalls
+	[P9_TVERSION]	  = p9_op_version,
+//	[P9_TAUTH]		  = p9_op_auth, // Not implemented
+	[P9_TATTACH]	  = p9_op_attach,
+//	[P9_TERROR]		  = p9_op_error,		// Not used
+	[P9_TFLUSH]		  = p9_op_flush,
+	[P9_TWALK]		  = p9_op_walk,
+//	[P9_TOPEN]		  = p9_op_open, // Not supported in 9P2000.L
+//	[P9_TCREATE]	  = p9_op_create,	// Not supported in 9P2000.L
+	[P9_TREAD]		  = p9_op_read,
+	[P9_TWRITE]		  = p9_op_write,
+	[P9_TCLUNK]		  = p9_op_clunk,
+	[P9_TREMOVE]	  = p9_op_remove,
+//	[P9_TSTAT]		  = p9_op_stat, // Not implemented
+//	[P9_TWSTAT]		  = p9_op_wstat,	// Not implemented
 };
 
-static const char *translate [] = {
-	[P9_TLERROR]      = "error",
-	[P9_TSTATFS]      = "statfs",
-	[P9_TLOPEN]       = "open",
-	[P9_TLCREATE]     = "create",
-	[P9_TSYMLINK]     = "symlink",
-	[P9_TMKNOD]       = "mknod",
-	[P9_TRENAME]      = "rename",
-	[P9_TREADLINK]    = "readlink",
-	[P9_TGETATTR]     = "getattr",
-	[P9_TSETATTR]     = "setattr",
+static const char * const translate[] = {
+	[P9_TLERROR]	  = "error",
+	[P9_TSTATFS]	  = "statfs",
+	[P9_TLOPEN]		  = "open",
+	[P9_TLCREATE]	  = "create",
+	[P9_TSYMLINK]	  = "symlink",
+	[P9_TMKNOD]		  = "mknod",
+	[P9_TRENAME]	  = "rename",
+	[P9_TREADLINK]	  = "readlink",
+	[P9_TGETATTR]	  = "getattr",
+	[P9_TSETATTR]	  = "setattr",
 	[P9_TXATTRWALK]   = "xattrwalk",
 	[P9_TXATTRCREATE] = "xattrcreate",
-	[P9_TREADDIR]     = "readdir",
-	[P9_TFSYNC]       = "fsync",
-	[P9_TLOCK]        = "lock",
-	[P9_TGETLOCK]     = "getlock",
-	[P9_TLINK]        = "link",
-	[P9_TMKDIR]       = "mkdir",
-	[P9_TRENAMEAT]    = "renameat",
-	[P9_TUNLINKAT]    = "unlinkat",
-	[P9_TVERSION]     = "version",
-	[P9_TAUTH]        = "auth",
-	[P9_TATTACH]      = "attach",
-	[P9_TERROR]       = "error",
-	[P9_TFLUSH]       = "flush",
-	[P9_TWALK]        = "walk",
-	[P9_TOPEN]        = "open",
-	[P9_TCREATE]      = "create",
-	[P9_TREAD]        = "read",
-	[P9_TWRITE]       = "write",
-	[P9_TCLUNK]       = "clunk",
-	[P9_TREMOVE]      = "remove",
-	[P9_TSTAT]        = "stat",
-	[P9_TWSTAT]       = "wstat",
+	[P9_TREADDIR]	  = "readdir",
+	[P9_TFSYNC]		  = "fsync",
+	[P9_TLOCK]		  = "lock",
+	[P9_TGETLOCK]	  = "getlock",
+	[P9_TLINK]		  = "link",
+	[P9_TMKDIR]		  = "mkdir",
+	[P9_TRENAMEAT]	  = "renameat",
+	[P9_TUNLINKAT]	  = "unlinkat",
+	[P9_TVERSION]	  = "version",
+	[P9_TAUTH]		  = "auth",
+	[P9_TATTACH]	  = "attach",
+	[P9_TERROR]		  = "error",
+	[P9_TFLUSH]		  = "flush",
+	[P9_TWALK]		  = "walk",
+	[P9_TOPEN]		  = "open",
+	[P9_TCREATE]	  = "create",
+	[P9_TREAD]		  = "read",
+	[P9_TWRITE]		  = "write",
+	[P9_TCLUNK]		  = "clunk",
+	[P9_TREMOVE]	  = "remove",
+	[P9_TSTAT]		  = "stat",
+	[P9_TWSTAT]		  = "wstat",
 };
 
 struct p9_header {
 	uint32_t size;
 	uint8_t id;
 	uint16_t tag;
-} __attribute__((packed));
+} __packed;
 
 struct p9_io_header {
 	uint32_t size;
@@ -1371,7 +1395,7 @@ struct p9_io_header {
 	uint32_t fid;
 	uint64_t offset;
 	uint32_t count;
-} __attribute__((packed));
+} __packed;
 
 static struct p9_fcall *new_pdu(size_t size)
 {
@@ -1381,7 +1405,8 @@ static struct p9_fcall *new_pdu(size_t size)
 	pdu->size = 0;	// write offset
 	pdu->offset = 0;	// read offset
 	pdu->capacity = size;
-	pdu->sdata = (void *)pdu + sizeof(struct p9_fcall);	// Make the data area right after the pdu structure
+	pdu->sdata = (void *)pdu + sizeof(struct p9_fcall);
+	// Make the data area right after the pdu structure
 
 	return pdu;
 }
@@ -1397,13 +1422,16 @@ static size_t pdu_fill(struct p9_fcall *pdu, struct iov_iter *from, size_t size)
 	return size - ret;
 }
 
-void do_9p_request(struct p9_server *s, struct iov_iter *req, struct iov_iter *resp)
+void do_9p_request(struct p9_server *s, struct iov_iter *req,
+		struct iov_iter *resp)
 {
 	int err = -EOPNOTSUPP;
 	u8 cmd;
 	struct iov_iter data;
 	struct p9_fcall *in, *out;
-	struct p9_io_header *hdr;	// Assume the operation is an IO operation to save additional copy_from_iter.
+	struct p9_io_header *hdr;
+	// Assume the operation is an IO operation to save additional
+	// copy_from_iter.
 
 	in = new_pdu(req->count);
 	out = new_pdu(resp->count);
@@ -1416,7 +1444,7 @@ void do_9p_request(struct p9_server *s, struct iov_iter *req, struct iov_iter *r
 	in->id = cmd = hdr->id;
 	out->id = hdr->id + 1;
 
-	printk(KERN_NOTICE "do_9p_request: %s! %d\n", translate[cmd], in->tag);
+	pr_notice("do_9p_request: %s! %d\n", translate[cmd], in->tag);
 
 	if (cmd < ARRAY_SIZE(p9_ops) && p9_ops[cmd]) {
 		if (cmd == P9_TREAD || cmd == P9_TWRITE) {
@@ -1424,8 +1452,11 @@ void do_9p_request(struct p9_server *s, struct iov_iter *req, struct iov_iter *r
 			if (hdr->count > 1024) {
 				if (cmd == P9_TREAD) {
 					iov_iter_clone(&data, resp);
-					iov_iter_advance(&data, sizeof(struct p9_header) + sizeof(u32));
-					resp->count = sizeof(struct p9_header) + sizeof(u32);	// Hack
+					iov_iter_advance(&data,
+						sizeof(struct p9_header) +
+						sizeof(u32));
+					resp->count = sizeof(struct p9_header) +
+						sizeof(u32);
 
 					err = p9_op_readv(s, in, out, &data);
 				} else
@@ -1440,7 +1471,8 @@ void do_9p_request(struct p9_server *s, struct iov_iter *req, struct iov_iter *r
 		} else {
 			/* Copy the rest data */
 			if (hdr->size > sizeof(struct p9_io_header))
-				pdu_fill(in, req, hdr->size - sizeof(struct p9_io_header));
+				pdu_fill(in, req, hdr->size -
+						sizeof(struct p9_io_header));
 
 			err = p9_ops[cmd](s, in, out);
 		}
@@ -1448,20 +1480,21 @@ void do_9p_request(struct p9_server *s, struct iov_iter *req, struct iov_iter *r
 		kfree(in);
 	} else {
 		if (cmd < ARRAY_SIZE(p9_ops))
-			printk(KERN_WARNING "!!!not implemented: %s\n", translate[cmd]);
+			pr_warn("!!!not implemented: %s\n", translate[cmd]);
 		else
-			printk(KERN_WARNING "!!!cmd too large: %d\n", (u32) cmd);
+			pr_warn("!!!cmd too large: %d\n", (u32) cmd);
 	}
 
 	if (err) {
-		printk(KERN_ERR "9p request error: %d\n", err);
+		pr_err("9p request error: %d\n", err);
 		/* Compose an error reply */
 		out->size = 0;
-		p9pdu_writef(out, "dbwd", 
-			sizeof(struct p9_header) + sizeof(u32), 
+		p9pdu_writef(out, "dbwd",
+			sizeof(struct p9_header) + sizeof(u32),
 			P9_RLERROR, out->tag, (u32) -err);
 	} else {
 		size_t t = out->size;
+
 		out->size = 0;
 		p9pdu_writef(out, "dbw", t, out->id, out->tag);
 		out->size = t;
@@ -1475,7 +1508,7 @@ struct p9_server *p9_server_create(struct path *root)
 {
 	struct p9_server *s;
 
-	printk(KERN_INFO "9p server create!\n");
+	pr_info("9p server create!\n");
 
 	s = kmalloc(sizeof(struct p9_server), GFP_KERNEL);
 	if (!s)
