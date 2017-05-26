@@ -205,8 +205,8 @@ static int p9_op_getattr(struct p9_server *s, struct p9_fcall *in,
 	struct p9_qid qid;
 
 	p9pdu_readf(in, "dq", &fid_val, &request_mask);
-	p9s_debug("getattr : fid %d,
-			request_mask %lld\n", fid_val, request_mask);
+	p9s_debug("getattr : fid %d, request_mask %lld\n",
+			fid_val, request_mask);
 
 	fid = lookup_fid(s, fid_val);
 	if (IS_ERR(fid))
@@ -1254,7 +1254,7 @@ static int p9_op_lock(struct p9_server *s, struct p9_fcall *in,
 	p9pdu_readf(in, "dbdqqds", &fid_val, &flock.type,
 				&flock.flags, &flock.start, &flock.length,
 				&flock.proc_id, &flock.client_id);
-	p9s_debug("lock : fid %d type %i flags %d,
+	p9s_debug("lock : fid %d type %i flags %d,\
 			start %lld length %lld proc_id %d client_id %s\n",
 			fid_val, flock.type, flock.flags, flock.start,
 			flock.length, flock.proc_id, flock.client_id);
@@ -1275,7 +1275,7 @@ static int p9_op_getlock(struct p9_server *s, struct p9_fcall *in,
 	p9pdu_readf(in, "dbqqds", &fid_val, &glock.type,
 				&glock.start, &glock.length, &glock.proc_id,
 				&glock.client_id);
-	p9s_debug("getlock : fid %d, type %i start %lld,
+	p9s_debug("getlock : fid %d, type %i start %lld,\
 		length %lld proc_id %d client_id %s\n", fid_val, glock.type,
 		glock.start, glock.length, glock.proc_id, glock.client_id);
 
@@ -1284,7 +1284,7 @@ static int p9_op_getlock(struct p9_server *s, struct p9_fcall *in,
 	p9pdu_writef(out, "bqqds", glock.type,
 				 glock.start, glock.length, glock.proc_id,
 				 glock.client_id);
-	p9s_debug("getlock : type %i start %lld,
+	p9s_debug("getlock : type %i start %lld,\
 		length %lld proc_id %d client_id %s\n", glock.type,
 		glock.start, glock.length, glock.proc_id, glock.client_id);
 

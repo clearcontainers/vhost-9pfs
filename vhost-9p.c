@@ -20,7 +20,8 @@
 #include "vhost-9p.h"
 
 /* Max number of bytes transferred before requeueing the job.
- * Using this limit prevents one virtqueue from starving others. */
+ * Using this limit prevents one virtqueue from starving others.
+ */
 #define VHOST_9P_WEIGHT 0x80000
 #define VHOST_SET_PATH 3
 
@@ -29,11 +30,13 @@ enum {
 };
 
 /* Expects to be always run from workqueue - which acts as
- * read-size critical section for our kind of RCU. */
+ * read-size critical section for our kind of RCU.
+ */
+
 static void handle_vq(struct vhost_9p *n)
 {
 	struct vhost_virtqueue *vq = &n->vqs[VHOST_9P_VQ];
-	unsigned out, in;
+	unsigned int out, in;
 	int head;
 	size_t out_len, in_len, total_len = 0;
 	struct iov_iter req, resp;
@@ -95,14 +98,14 @@ static int vhost_9p_open(struct inode *inode, struct file *f)
 {
 	struct vhost_dev *dev;
 	struct vhost_virtqueue **vqs;
-	struct vhost_9p *n = kmalloc(sizeof *n, GFP_KERNEL);
+	struct vhost_9p *n = kmalloc(sizeof(*n), GFP_KERNEL);
 
-	printk(KERN_INFO "VHOST_9P_OPEN\n");
+	pr_info("VHOST_9P_OPEN\n");
 
 	if (!n)
 		return -ENOMEM;
 
-	vqs = kmalloc(VHOST_9P_VQ_MAX * sizeof(*vqs), GFP_KERNEL);
+	vqs = kmalloc_array(VHOST_9P_VQ_MAX, sizeof(*vqs), GFP_KERNEL);
 	if (!vqs) {
 		kfree(n);
 		return -ENOMEM;
@@ -151,13 +154,14 @@ static int vhost_9p_release(struct inode *inode, struct file *f)
 	struct vhost_9p *n = f->private_data;
 	void *private;
 
-	printk(KERN_INFO "VHOST_9P_RELEASE\n");
+	pr_info("VHOST_9P_RELEASE\n");
 
 	vhost_9p_stop(n, &private);
 	vhost_9p_flush(n);
 	vhost_dev_cleanup(&n->dev, false);
 	/* We do an extra flush before freeing memory,
-	 * since jobs can re-queue themselves. */
+	 * since jobs can re-queue themselves.
+	 */
 	vhost_9p_flush(n);
 
 	kfree(n);
@@ -241,7 +245,7 @@ long vhost_9p_set_path(struct vhost_9p *n, void __user *argp)
 	len = strlen(dst);
 	if (len > PATH_MAX - 1)
 		return -ENAMETOOLONG;
-	retry:
+retry:
 		err = kern_path(dst, lookup_flags, &root);
 		if (!err) {
 			n->server = p9_server_create(&root);
@@ -271,11 +275,11 @@ static long vhost_9p_ioctl(struct file *f, unsigned int ioctl,
 	switch (ioctl) {
 	case VHOST_GET_FEATURES:
 		features = VHOST_FEATURES;
-		if (copy_to_user(featurep, &features, sizeof features))
+		if (copy_to_user(featurep, &features, sizeof(features)))
 			return -EFAULT;
 		return 0;
 	case VHOST_SET_FEATURES:
-		if (copy_from_user(&features, featurep, sizeof features))
+		if (copy_from_user(&features, featurep, sizeof(features)))
 			return -EFAULT;
 		if (features & ~VHOST_9P_FEATURES)
 			return -EOPNOTSUPP;
