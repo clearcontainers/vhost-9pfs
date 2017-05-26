@@ -919,7 +919,65 @@ static int p9_op_rename(struct p9_server *s, struct p9_fcall *in,
 					  new_dentry->d_parent->d_inode, new_dentry,
 					  NULL, 0);
 }
-// TODO: gid
+
+static int p9_op_renameat(struct p9_server *s, struct p9_fcall *in,
+						struct p9_fcall *out)
+{
+	int err = 0;
+	u32 oldfid_val, newfid_val;
+    char *oldname = NULL, *newname = NULL;
+	struct p9_server_fid *oldfid, *newfid;
+	struct dentry *old_dentry, *new_dentry;
+
+	p9pdu_readf(in, "dsds", &oldfid_val,  &oldname, &newfid_val, &newname);
+
+	oldfid = lookup_fid(s, oldfid_val);
+	if (IS_ERR(oldfid)) {
+        err = PTR_ERR(oldfid);
+        goto out;
+    }
+
+    newfid = lookup_fid(s, newfid_val);
+	if (IS_ERR(newfid)) {
+        err = PTR_ERR(newfid);
+        goto out;
+    }
+
+	p9s_debug("renameat: oldfid %d, oldname %s, newfid %d, newname %s\n",
+            oldfid_val, oldname, newfid_val, newname );
+
+    old_dentry = lookup_one_len(oldname, oldfid->path.dentry,
+                     strlen(oldname));
+    if (IS_ERR(old_dentry)) {
+        err = PTR_ERR(old_dentry);
+        goto out;
+    } else if (!d_really_is_positive(old_dentry)) {
+        pr_err("renameat: source file %s doesn't exist!\n", oldname);
+        err = -ENOENT;
+        goto out;
+    }
+
+    new_dentry = lookup_one_len(newname, newfid->path.dentry,
+                     strlen(newname));
+    if (IS_ERR(new_dentry)) {
+        err = PTR_ERR(new_dentry);
+        goto out;
+    } else if (d_really_is_positive(new_dentry)) {
+        pr_err("renameat: destiny file %s exists!\n", newname);
+        err = -EEXIST;
+        goto out;
+    }
+	p9s_debug("renameat: call vfs_rename\n");
+
+	err = vfs_rename(old_dentry->d_parent->d_inode, old_dentry,
+					  new_dentry->d_parent->d_inode, new_dentry,
+					  NULL, 0);
+out:
+    kfree(oldname);
+    kfree(newname);
+    return err;
+}
+
 static int p9_op_mkdir(struct p9_server *s, struct p9_fcall *in,
 					   struct p9_fcall *out)
 {
@@ -1249,7 +1307,7 @@ static p9_server_op *p9_ops [] = {
 	[P9_TGETLOCK]     = p9_op_getlock,
 	[P9_TLINK]        = p9_op_link,
 	[P9_TMKDIR]       = p9_op_mkdir,
-//	[P9_TRENAMEAT]    = p9_op_renameat,	// Not supported. No easy way to implement besides syscalls
+	[P9_TRENAMEAT]    = p9_op_renameat,
 //	[P9_TUNLINKAT]    = p9_op_unlinkat,	// Not supported. No easy way to implement besides syscalls
 	[P9_TVERSION]     = p9_op_version,
 //	[P9_TAUTH]        = p9_op_auth,	// Not implemented
