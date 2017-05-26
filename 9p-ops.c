@@ -1090,6 +1090,7 @@ static int p9_op_fsync(struct p9_server *s, struct p9_fcall *in,
 	struct p9_server_fid *fid;
 
 	p9pdu_readf(in, "dd", &fid_val, &datasync);
+	p9s_debug("fsync : fid %d datasync:%d\n", fid_val, datasync);
 
 	fid = lookup_fid(s, fid_val);
 	if (IS_ERR(fid))
@@ -1099,6 +1100,8 @@ static int p9_op_fsync(struct p9_server *s, struct p9_fcall *in,
 
 	if (!IS_ERR_OR_NULL(fid->filp))
 		err = vfs_fsync(fid->filp, datasync);
+
+	p9s_debug("fsync : fid %d\n", fid->fid);
 
 	return err;
 }
@@ -1122,6 +1125,7 @@ static int p9_op_mknod(struct p9_server *s, struct p9_fcall *in,
 		return PTR_ERR(dfid);
 
 	p9pdu_readf(in, "sdddd", &name, &mode, &major, &minor, &gid);
+	p9s_debug("mknod : name %s mode %d major %d minor %d\n", name, mode, major, minor);
 
 	new_path.mnt = dfid->path.mnt;
 	new_path.dentry = lookup_one_len(name, dfid->path.dentry, strlen(name));
@@ -1147,6 +1151,8 @@ static int p9_op_mknod(struct p9_server *s, struct p9_fcall *in,
 		return err;
 
 	p9pdu_writef(out, "Q", &qid);
+	p9s_debug("mknod : qid = %x.%llx.%x\n",
+			qid.type, (unsigned long long)qid.path, qid.version);
 
 	return 0;
 }
@@ -1160,6 +1166,10 @@ static int p9_op_lock(struct p9_server *s, struct p9_fcall *in,
 	p9pdu_readf(in, "dbdqqds", &fid_val, &flock.type,
 			    &flock.flags, &flock.start, &flock.length,
 			    &flock.proc_id, &flock.client_id);
+	p9s_debug("lock : fid %d type %i flags %d "
+			"start %lld length %lld proc_id %d client_id %s\n",
+			fid_val, flock.type, flock.flags, flock.start,
+			flock.length, flock.proc_id, flock.client_id);
 
 	kfree(flock.client_id);
 
@@ -1177,12 +1187,18 @@ static int p9_op_getlock(struct p9_server *s, struct p9_fcall *in,
 	p9pdu_readf(in, "dbqqds", &fid_val, &glock.type,
 				&glock.start, &glock.length, &glock.proc_id,
 				&glock.client_id);
+	p9s_debug("getlock : fid %d, type %i start %lld "
+		"length %lld proc_id %d client_id %s\n", fid_val, glock.type,
+		glock.start, glock.length, glock.proc_id, glock.client_id);
 
 	/* Just return success */
 	glock.type = F_UNLCK;
 	p9pdu_writef(out, "bqqds", glock.type,
 				 glock.start, glock.length, glock.proc_id,
 				 glock.client_id);
+	p9s_debug("getlock : type %i start %lld "
+		"length %lld proc_id %d client_id %s\n", glock.type,
+		glock.start, glock.length, glock.proc_id, glock.client_id);
 
 	kfree(glock.client_id);
 	return 0;
@@ -1194,6 +1210,7 @@ static int p9_op_flush(struct p9_server *s, struct p9_fcall *in,
 	u16 tag, oldtag;
 
 	p9pdu_readf(in, "ww", &tag, &oldtag);
+	p9s_debug("flush : tag %d\n", oldtag);
 	p9pdu_writef(out, "w", tag);
 
 	return 0;
