@@ -235,7 +235,7 @@ static int p9_op_clunk(struct p9_server *s, struct p9_fcall *in,
 
 	rb_erase(&fid->node, &s->fids);
 	kfree(fid);
-    p9s_debug("fid : %d destroyed\n ", fid_val);
+    p9s_debug("fid : %d destroyed \n", fid_val);
 	return 0;
 }
 /*
@@ -1120,35 +1120,31 @@ static int p9_op_link(struct p9_server *s, struct p9_fcall *in,
 static int p9_op_readlink(struct p9_server *s, struct p9_fcall *in,
 						  struct p9_fcall *out)
 {
-	int err;
-	char *path;
 	u32 fid_val;
 	struct p9_server_fid *fid;
 	struct dentry *dentry;
-	struct inode *inode;
+    const char *link = NULL;
+    DEFINE_DELAYED_CALL(done);
 
 	p9pdu_readf(in, "d", &fid_val);
 	p9s_debug("readlink : fid %d\n", fid_val);
 
 	fid = lookup_fid(s, fid_val);
-
 	if (IS_ERR(fid))
 		return PTR_ERR(fid);
 
 	dentry = fid->path.dentry;
-	inode = d_backing_inode(dentry);
-	path = kmalloc(PATH_MAX, GFP_KERNEL);
 
 	// TODO: security check
-	err = inode->i_op->readlink(dentry, path, PATH_MAX);
+    link = vfs_get_link(dentry, &done);
+    if (IS_ERR(link))
+        return PTR_ERR(link);
 
-	if (!err)
-		p9pdu_writef(out, "s", path);
+	p9pdu_writef(out, "s", link);
 
-	p9s_debug("readlink : path %s\n", path);
-	kfree(path);
+	p9s_debug("readlink : path %s\n", link);
 
-	return err;
+	return 0;
 }
 
 static int p9_op_fsync(struct p9_server *s, struct p9_fcall *in,
