@@ -25,6 +25,7 @@
 #include "vhost-9p.h"
 #include "protocol.h"
 
+#define MAX_FILE_NAME 512
 const size_t P9_PDU_HDR_LEN = sizeof(u32) + sizeof(u8) + sizeof(u16);
 /*
 	TODO:
@@ -487,7 +488,7 @@ struct p9_readdir_ctx {
 
 	struct {
 		struct p9_qid qid;
-		const char *name;
+		char name[MAX_FILE_NAME];
 		unsigned int d_type;
 	} prev;
 };
@@ -509,21 +510,30 @@ static int p9_readdir_cb(struct dir_context *ctx, const char *name, int namlen,
 	struct path path;
 	struct p9_readdir_ctx *_ctx = container_of(ctx, struct p9_readdir_ctx, ctx);
 
-	write_len = sizeof(u8) + 	// qid.type. Not using sizeof(struct p9_qid) because of the size is padded.
-				sizeof(u32) + 	// qid.version
-				sizeof(u64) + 	// qid.path
-				sizeof(u64) + 	// offset
-				sizeof(u8) + 	// d_type
-				sizeof(u16) + 	// name.len
-				namlen;			// name
 
+    write_len = sizeof(u8) +        // qid.type. Not using sizeof(struct p9_qid) because of the siz
+                sizeof(u32) +   // qid.version
+                sizeof(u64) +   // qid.path
+                sizeof(u64) +   // offset
+                sizeof(u8) +    // d_type
+                sizeof(u16) +   // name.len
+                namlen;                 // name
+
+    if (namlen >= MAX_FILE_NAME) {
+		printk(KERN_ERR "max file name is %d, this file name is %d\n",
+                MAX_FILE_NAME - 1, namlen);
+        return 1;
+    }
 	// If writting this dirent would cause an overflow, terminate iterate_dir.
 	if (_ctx->i + write_len > _ctx->count)
 		return 1;
 
 	// Writting the previous element with current offset
-	if (_ctx->i)
+	if (_ctx->i) {
+        p9s_debug("readdir_cb: offset %lld  d_type %d  name %s\n",
+                    offset, _ctx->prev.d_type, _ctx->prev.name);
 		p9pdu_writef(_ctx->out, "Qqbs", &_ctx->prev.qid, (u64) offset, _ctx->prev.d_type, _ctx->prev.name);
+    }
 
 	/* Prepare the dirent for the next iteration. */
 
@@ -550,7 +560,8 @@ static int p9_readdir_cb(struct dir_context *ctx, const char *name, int namlen,
 	if (_ctx->err)
 		goto out;
 
-	_ctx->prev.name = name;
+    strncpy(_ctx->prev.name, name, namlen);
+    _ctx->prev.name[namlen] = 0;
 	_ctx->prev.d_type = d_type;
 
 	_ctx->i += write_len;
