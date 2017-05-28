@@ -858,6 +858,36 @@ static int p9_op_writev(struct p9_server *s, struct p9_fcall *in,
 	return 0;
 }
 
+static int p9_op_unlinkat(struct p9_server *s, struct p9_fcall *in,
+						struct p9_fcall *out)
+{
+	u32 fid_val;
+	char *name;
+	struct p9_server_fid *fid;
+	struct dentry *dentry;
+	int err;
+
+	p9pdu_readf(in, "ds", &fid_val, &name);
+
+	fid = lookup_fid(s, fid_val);
+	if (IS_ERR(fid))
+		return PTR_ERR(fid);
+
+	p9s_debug("unlinkat : fid %d, name %s\n", fid_val, name);
+	dentry = lookup_one_len(name, fid->path.dentry, strlen(name));
+
+	if (d_really_is_negative(dentry))
+		return -ENOENT;
+
+	if (S_ISDIR(dentry->d_inode->i_mode))
+		err = vfs_rmdir(dentry->d_parent->d_inode, dentry);
+	else
+		err = vfs_unlink(dentry->d_parent->d_inode, dentry, NULL);
+
+	p9s_debug("unlinkat : %s is removed\n", name);
+	return err;
+}
+
 static int p9_op_remove(struct p9_server *s, struct p9_fcall *in,
 						struct p9_fcall *out)
 {
@@ -1327,7 +1357,7 @@ static p9_server_op *p9_ops[] = {
 	[P9_TLINK]		  = p9_op_link,
 	[P9_TMKDIR]		  = p9_op_mkdir,
 	[P9_TRENAMEAT]	  = p9_op_renameat,
-//	[P9_TUNLINKAT]	  = p9_op_unlinkat,
+	[P9_TUNLINKAT]	  = p9_op_unlinkat,
 //Not supported. No easy way to implement besides syscalls
 	[P9_TVERSION]	  = p9_op_version,
 //	[P9_TAUTH]		  = p9_op_auth, // Not implemented
