@@ -719,21 +719,32 @@ static int p9_op_readv(struct p9_server *s, struct p9_fcall *in,
 static int p9_op_setattr(struct p9_server *s, struct p9_fcall *in,
 						 struct p9_fcall *out)
 {
-	int err = 0; /* TODO: remove */
+	int err = 0;
 	u32 fid_val;
 	struct p9_server_fid *fid;
 	struct p9_iattr_dotl p9attr;
+	struct iattr iattr;
+	struct dentry *dentry;
 
 	p9pdu_readf(in, "dddugqqqqq", &fid_val,
 				&p9attr.valid, &p9attr.mode,
 				&p9attr.uid, &p9attr.gid, &p9attr.size,
 				&p9attr.atime_sec, &p9attr.atime_nsec,
 				&p9attr.mtime_sec, &p9attr.mtime_nsec);
-	p9s_debug("setattr : fid %d\n", fid_val);
+	p9s_debug("setattr : fid %d, valid %x, mode %x, uid %d, gid %d\n"
+			"size %lld, at_sec %lld, at_nsec %lld\n"
+			"mt_sec %lld, mt_nsec %lld\n",
+			fid_val, p9attr.valid, p9attr.mode,
+				p9attr.uid.val, p9attr.gid.val, p9attr.size,
+				p9attr.atime_sec, p9attr.atime_nsec,
+				p9attr.mtime_sec, p9attr.mtime_nsec);
+
 
 	fid = lookup_fid(s, fid_val);
 	if (IS_ERR(fid))
 		return PTR_ERR(fid);
+	dentry = fid->path.dentry;
+	memset(&iattr, 0, sizeof(struct iattr));
 /*
 	if (p9attr.valid & ATTR_MODE) {
 		err = chmod(fid->path, p9attr.mode);
@@ -770,21 +781,28 @@ static int p9_op_setattr(struct p9_server *s, struct p9_fcall *in,
 	 * If the only valid entry in iattr is ctime we can call
 	 * chown(-1,-1) to update the ctime of the file
 	 */
-/*	if ((p9attr.valid & (ATTR_UID | ATTR_GID)) ||
+	if ((p9attr.valid & (ATTR_UID | ATTR_GID)) ||
 		((p9attr.valid & ATTR_CTIME)
 		 && !((p9attr.valid & ATTR_MASK) & ~ATTR_CTIME))) {
-		if (!(p9attr.valid & ATTR_UID))
-			p9attr.uid = KUIDT_INIT(-1);
-
-		if (!(p9attr.valid & ATTR_GID))
-			p9attr.gid = KGIDT_INIT(-1);
-
-		err = lchown(fid->path, __kuid_val(p9attr.uid),
-				__kgid_val(p9attr.gid));
+		if (p9attr.valid & ATTR_UID) {
+			iattr.ia_valid |= ATTR_UID;
+			iattr.ia_uid = p9attr.uid;
+		} else {
+			iattr.ia_uid = KUIDT_INIT(-1);
+		}
+		if ((p9attr.valid & ATTR_GID)) {
+			iattr.ia_valid |= ATTR_GID;
+			iattr.ia_gid = p9attr.gid;
+		} else {
+			iattr.ia_gid = KGIDT_INIT(-1);
+		}
+		inode_lock(dentry->d_inode);
+		err = notify_change(dentry, &iattr, NULL);
+		inode_unlock(dentry->d_inode);
 		if (err < 0)
 			return err;
 	}
-*/
+
 	if (p9attr.valid & ATTR_SIZE) {
 		err = vfs_truncate(&fid->path, p9attr.size);
 
@@ -792,7 +810,6 @@ static int p9_op_setattr(struct p9_server *s, struct p9_fcall *in,
 			return err;
 	}
 	p9s_debug("setattr : fid %d\n", fid->fid);
-
 	return 0;
 }
 
