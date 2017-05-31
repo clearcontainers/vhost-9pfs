@@ -787,39 +787,43 @@ static int p9_op_setattr(struct p9_server *s, struct p9_fcall *in,
 		return PTR_ERR(fid);
 	dentry = fid->path.dentry;
 	memset(&iattr, 0, sizeof(struct iattr));
-/*
+
 	if (p9attr.valid & ATTR_MODE) {
-		err = chmod(fid->path, p9attr.mode);
+		iattr.ia_valid |= ATTR_MODE | ATTR_CTIME;
+		iattr.ia_mode = p9attr.mode;
+		iattr.ia_ctime = current_time(dentry->d_inode);
+	}
+
+	if (p9attr.valid & ATTR_ATIME) {
+		iattr.ia_valid |= ATTR_ATIME;
+		if (p9attr.valid & ATTR_ATIME_SET) {
+			iattr.ia_valid |= ATTR_ATIME_SET;
+			iattr.ia_atime.tv_sec = p9attr.atime_sec;
+			iattr.ia_atime.tv_nsec = p9attr.atime_nsec;
+		} else
+			iattr.ia_atime.tv_nsec = UTIME_NOW;
+	} else
+		iattr.ia_atime.tv_nsec = UTIME_OMIT;
+
+	if (p9attr.valid & ATTR_MTIME) {
+		iattr.ia_valid |= ATTR_MTIME;
+		if (p9attr.valid & ATTR_MTIME_SET) {
+			iattr.ia_valid |= ATTR_MTIME_SET;
+			iattr.ia_mtime.tv_sec = p9attr.mtime_sec;
+			iattr.ia_mtime.tv_nsec = p9attr.mtime_nsec;
+		} else
+			iattr.ia_mtime.tv_nsec = UTIME_NOW;
+	} else
+		iattr.ia_mtime.tv_nsec = UTIME_OMIT;
+
+	if (iattr.ia_valid) {
+		inode_lock(dentry->d_inode);
+		err = notify_change(dentry, &iattr, NULL);
+		inode_unlock(dentry->d_inode);
 		if (err < 0)
 			return err;
 	}
-
-	if (p9attr.valid & (ATTR_ATIME | ATTR_MTIME)) {
-		struct timespec times[2];
-
-		if (p9attr.valid & ATTR_ATIME) {
-			if (p9attr.valid & ATTR_ATIME_SET) {
-				times[0].tv_sec = p9attr.atime_sec;
-				times[0].tv_nsec = p9attr.atime_nsec;
-			} else
-				times[0].tv_nsec = UTIME_NOW;
-		} else
-			times[0].tv_nsec = UTIME_OMIT;
-
-		if (p9attr.valid & ATTR_MTIME) {
-			if (p9attr.valid & ATTR_MTIME_SET) {
-				times[1].tv_sec = p9attr.mtime_sec;
-				times[1].tv_nsec = p9attr.mtime_nsec;
-			} else
-				times[1].tv_nsec = UTIME_NOW;
-		} else
-			times[1].tv_nsec = UTIME_OMIT;
-
-		err = utimensat(-1, fid->path, times, AT_SYMLINK_NOFOLLOW);
-		if (err < 0)
-			return err;
-	}
-*/	/*
+	/*
 	 * If the only valid entry in iattr is ctime we can call
 	 * chown(-1,-1) to update the ctime of the file
 	 */
