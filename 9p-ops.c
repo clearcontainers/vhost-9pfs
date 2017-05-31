@@ -209,8 +209,8 @@ static int p9_op_attach(struct p9_server *s, struct p9_fcall *in,
 
 	p9pdu_readf(in, "ddssd", &fid_val, &afid,
 				&uname, &aname, &uid);
-	p9s_debug("attach : afid %d uname %s aname %s\n",
-				afid ? afid : -1, uname, aname);
+	p9s_debug("attach : afid %d uname %s aname %s uid %d\n",
+				afid ? afid : -1, uname, aname, uid);
 	kfree(uname);
 	kfree(aname);
 
@@ -374,6 +374,7 @@ static int p9_op_walk(struct p9_server *s, struct p9_fcall *in,
 		newfid = new_fid(s, newfid_val, &new_path);
 		if (IS_ERR(newfid))
 			return PTR_ERR(newfid);
+		newfid->uid = fid->uid;
 	}
 
 	t = out->size;
