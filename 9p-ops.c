@@ -136,10 +136,10 @@ static void get_owner(struct dentry *d, kuid_t *uid, kgid_t *gid)
 	}
 }
 
-static void set_owner(struct dentry  *d, u32 uid, u32 gid, int flags)
+static void set_owner(struct dentry  *d, int uid, int gid, int flags)
 {
 	char buf[16];
-
+	p9s_debug("set_owner : uid %d, gid %d\n", uid, gid);
 	if (uid >= 0) {
 		snprintf(buf, 16, "%d", uid);
 		vfs_removexattr(d, "user.vuid");
@@ -298,6 +298,7 @@ static int p9_op_walk(struct p9_server *s, struct p9_fcall *in,
 	struct p9_qid qid;
 	struct p9_server_fid *fid, *newfid;
 	struct path new_path;
+	struct dentry *dentry;
 
 	p9pdu_readf(in, "ddw", &fid_val, &newfid_val, &nwname);
 
@@ -319,6 +320,7 @@ static int p9_op_walk(struct p9_server *s, struct p9_fcall *in,
 	out->size += sizeof(u16);
 
 	if (nwname) {
+		dentry = fid->path.dentry;
 		for (; nwqid < nwname; nwqid++) {
 			p9pdu_readf(in, "s", &name);
 			p9s_debug("walk : name %s\n", name);
@@ -329,31 +331,31 @@ static int p9_op_walk(struct p9_server *s, struct p9_fcall *in,
 
 			// TODO: lock may be needed
 			new_path.dentry =
-			   lookup_one_len(name, fid->path.dentry, strlen(name));
+				lookup_one_len(name, dentry, strlen(name));
 			kfree(name);
+			dput(dentry);
 
 			if (IS_ERR(new_path.dentry)) {
-				err = PTR_ERR(new_path.dentry);
-				break;
+				return PTR_ERR(new_path.dentry);
 			} else if (d_really_is_negative(new_path.dentry)) {
-				err = -ENOENT;
-				break;
+				return -ENOENT;
 			}
-
 			err = gen_qid(&new_path, &qid, NULL);
 			if (err)
-				break;
+				return err;
 
 			// TODO: verify if it's valid
-			dput(new_path.dentry);
-
 			p9pdu_writef(out, "Q", &qid);
 			p9s_debug("walk : qid = [%d] %x.%llx.%x\n",
 					nwqid, qid.type, qid.path, qid.version);
+
+			dentry = new_path.dentry;
 		}
 
 		if (!nwqid)
 			return err;
+
+		dput(new_path.dentry);
 	} else {
 		/* If nwname is 0, it's equivalent to walking
 		 * to the current directory. */
@@ -377,9 +379,8 @@ static int p9_op_walk(struct p9_server *s, struct p9_fcall *in,
 	t = out->size;
 	out->size = P9_PDU_HDR_LEN;
 	p9pdu_writef(out, "w", nwqid);
-	p9s_debug("walked : nwqid %d\n", nwqid);
 	out->size = t;
-
+	p9s_debug("walked : nwqid %d\n", nwqid);
 	return 0;
 }
 
