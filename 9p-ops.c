@@ -17,6 +17,7 @@
  */
 
 #include <linux/fs.h>
+#include <linux/xattr.h>
 #include <linux/stat.h>
 #include <linux/statfs.h>
 #include <linux/in.h>
@@ -114,6 +115,43 @@ static inline void iov_iter_clone(struct iov_iter *dst, struct iov_iter *src)
 	memcpy(dst, src, sizeof(struct iov_iter));
 }
 
+static void get_owner(struct dentry *d, kuid_t *uid, kgid_t *gid)
+{
+	int err;
+	char buf[16];
+
+	err = vfs_getxattr(d, "user.vuid", buf, 16);
+	if (err > 0 && err < 16) {
+		buf[err] = 0;
+		err = kstrtoint(buf, 10, &(uid->val));
+		if (err)
+			pr_err("get_owner:  kstrtoint failed for uid\n");
+	}
+	err = vfs_getxattr(d, "user.vgroup", buf, 16);
+	if (err > 0 && err < 16)  {
+		buf[err] = 0;
+		err = kstrtoint(buf, 10, &(gid->val));
+		if (err)
+			pr_err("get_owner:  kstrtoint failed for gid\n");
+	}
+}
+
+static void set_owner(struct dentry  *d, u32 uid, u32 gid, int flags)
+{
+	char buf[16];
+
+	if (uid >= 0) {
+		snprintf(buf, 16, "%d", uid);
+		vfs_removexattr(d, "user.vuid");
+		vfs_setxattr(d, "user.vuid", buf, strlen(buf), XATTR_CREATE);
+	}
+	if (gid >= 0) {
+		snprintf(buf, 16, "%d", gid);
+		vfs_removexattr(d, "user.vgroup");
+		vfs_setxattr(d, "user.vgroup", buf, strlen(buf), XATTR_CREATE);
+	}
+}
+
 static int gen_qid(struct path *path, struct p9_qid *qid, struct kstat *st)
 {
 	int err;
@@ -125,6 +163,7 @@ static int gen_qid(struct path *path, struct p9_qid *qid, struct kstat *st)
 	err = vfs_getattr(path, st);
 	if (err)
 		return err;
+	get_owner(path->dentry, &st->uid, &st->gid);
 
 	/* TODO: incomplete types */
 	qid->version = st->mtime.tv_sec;
@@ -467,6 +506,8 @@ static int p9_op_create(struct p9_server *s, struct p9_fcall *in,
 	if (err)
 		return err;
 
+	set_owner(new_path.dentry, dfid->uid, gid, XATTR_CREATE);
+
 	new_filp = dentry_open(&new_path,
 		build_openflags(flags) | O_CREAT, current_cred());
 	if (IS_ERR(new_filp))
@@ -781,26 +822,16 @@ static int p9_op_setattr(struct p9_server *s, struct p9_fcall *in,
 	 * If the only valid entry in iattr is ctime we can call
 	 * chown(-1,-1) to update the ctime of the file
 	 */
-	if ((p9attr.valid & (ATTR_UID | ATTR_GID)) ||
-		((p9attr.valid & ATTR_CTIME)
-		 && !((p9attr.valid & ATTR_MASK) & ~ATTR_CTIME))) {
+	if ((p9attr.valid & (ATTR_UID | ATTR_GID))) {
+		int uid = -1;
+		int gid = -1;
 		if (p9attr.valid & ATTR_UID) {
-			iattr.ia_valid |= ATTR_UID;
-			iattr.ia_uid = p9attr.uid;
-		} else {
-			iattr.ia_uid = KUIDT_INIT(-1);
+			uid = p9attr.uid.val;
 		}
 		if ((p9attr.valid & ATTR_GID)) {
-			iattr.ia_valid |= ATTR_GID;
-			iattr.ia_gid = p9attr.gid;
-		} else {
-			iattr.ia_gid = KGIDT_INIT(-1);
+			gid = p9attr.gid.val;
 		}
-		inode_lock(dentry->d_inode);
-		err = notify_change(dentry, &iattr, NULL);
-		inode_unlock(dentry->d_inode);
-		if (err < 0)
-			return err;
+		set_owner(dentry, uid, gid, XATTR_REPLACE);
 	}
 
 	if (p9attr.valid & ATTR_SIZE) {
