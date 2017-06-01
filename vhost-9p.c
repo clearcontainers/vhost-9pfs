@@ -233,18 +233,23 @@ static int vhost_9p_set_features(struct vhost_9p *n, u64 features)
 long vhost_9p_set_path(struct vhost_9p *n, void __user *argp)
 {
 	char __user *src = argp;
-	char dst[PATH_MAX];
+	char *dst = NULL;
 	size_t len;
 	int err;
 	unsigned int lookup_flags = LOOKUP_FOLLOW;
 	struct path root;
 
 	// TODO: improve srtlen(src)
-	if (copy_from_user(&dst, src, strnlen_user(src, PATH_MAX)))
-		return -EFAULT;
+	dst = kmalloc(PATH_MAX, GFP_KERNEL);
+	if (copy_from_user(dst, src, strnlen_user(src, PATH_MAX))) {
+		err = -EFAULT;
+		goto out;
+	}
 	len = strlen(dst);
-	if (len > PATH_MAX - 1)
-		return -ENAMETOOLONG;
+	if (len > PATH_MAX - 1) {
+		err = -ENAMETOOLONG;
+		goto out;
+	}
 retry:
 		err = kern_path(dst, lookup_flags, &root);
 		if (!err) {
@@ -258,6 +263,8 @@ retry:
 			goto retry;
 		}
 
+out:
+	kfree(dst);
 	return err;
 }
 

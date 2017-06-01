@@ -40,7 +40,7 @@
 #include "vhost-9p.h"
 #include "protocol.h"
 
-#define MAX_FILE_NAME 512
+#define MAX_FILE_NAME (NAME_MAX + 1)
 const size_t P9_PDU_HDR_LEN = sizeof(u32) + sizeof(u8) + sizeof(u16);
 
 struct p9_server_fid {
@@ -115,42 +115,6 @@ static inline void iov_iter_clone(struct iov_iter *dst, struct iov_iter *src)
 	memcpy(dst, src, sizeof(struct iov_iter));
 }
 
-static void get_owner(struct dentry *d, kuid_t *uid, kgid_t *gid)
-{
-	int err;
-	char buf[16];
-
-	err = vfs_getxattr(d, "user.vuid", buf, 16);
-	if (err > 0 && err < 16) {
-		buf[err] = 0;
-		err = kstrtoint(buf, 10, &(uid->val));
-		if (err)
-			pr_err("get_owner:  kstrtoint failed for uid\n");
-	}
-	err = vfs_getxattr(d, "user.vgroup", buf, 16);
-	if (err > 0 && err < 16)  {
-		buf[err] = 0;
-		err = kstrtoint(buf, 10, &(gid->val));
-		if (err)
-			pr_err("get_owner:  kstrtoint failed for gid\n");
-	}
-}
-
-static void set_owner(struct dentry  *d, int uid, int gid, int flags)
-{
-	char buf[16];
-	p9s_debug("set_owner : uid %d, gid %d\n", uid, gid);
-	if (uid >= 0) {
-		snprintf(buf, 16, "%d", uid);
-		vfs_removexattr(d, "user.vuid");
-		vfs_setxattr(d, "user.vuid", buf, strlen(buf), XATTR_CREATE);
-	}
-	if (gid >= 0) {
-		snprintf(buf, 16, "%d", gid);
-		vfs_removexattr(d, "user.vgroup");
-		vfs_setxattr(d, "user.vgroup", buf, strlen(buf), XATTR_CREATE);
-	}
-}
 
 static int gen_qid(struct path *path, struct p9_qid *qid, struct kstat *st)
 {
@@ -163,7 +127,6 @@ static int gen_qid(struct path *path, struct p9_qid *qid, struct kstat *st)
 	err = vfs_getattr(path, st);
 	if (err)
 		return err;
-	get_owner(path->dentry, &st->uid, &st->gid);
 
 	/* TODO: incomplete types */
 	qid->version = st->mtime.tv_sec;
@@ -179,6 +142,32 @@ static int gen_qid(struct path *path, struct p9_qid *qid, struct kstat *st)
 	return 0;
 }
 
+static int set_owner(struct dentry *d, int uid, int gid)
+{
+	int err = 0;
+	struct iattr iattr;
+
+	p9s_debug("set_owner : uid %d, gid %d\n", uid, gid);
+
+	memset(&iattr, 0, sizeof(struct iattr));
+
+	if (uid >= 0) {
+		iattr.ia_valid |= ATTR_UID;
+		iattr.ia_uid.val = uid;
+	}
+	if (gid >= 0) {
+		iattr.ia_valid |= ATTR_GID;
+		iattr.ia_gid.val = gid;
+	}
+	if (iattr.ia_valid) {
+		inode_lock(d->d_inode);
+		err = notify_change(d, &iattr, NULL);
+		inode_unlock(d->d_inode);
+		if (err < 0)
+			return err;
+	}
+	return 0;
+}
 /* 9p operation functions */
 
 static int p9_op_version(struct p9_server *s, struct p9_fcall *in,
@@ -282,6 +271,7 @@ static int p9_op_clunk(struct p9_server *s, struct p9_fcall *in,
 		filp_close(fid->filp, NULL);
 
 	rb_erase(&fid->node, &s->fids);
+	dput(fid->path.dentry);
 	kfree(fid);
 	p9s_debug("fid : %d destroyed\n", fid_val);
 	return 0;
@@ -333,8 +323,6 @@ static int p9_op_walk(struct p9_server *s, struct p9_fcall *in,
 			new_path.dentry =
 				lookup_one_len(name, dentry, strlen(name));
 			kfree(name);
-			dput(dentry);
-
 			if (IS_ERR(new_path.dentry)) {
 				return PTR_ERR(new_path.dentry);
 			} else if (d_really_is_negative(new_path.dentry)) {
@@ -349,13 +337,14 @@ static int p9_op_walk(struct p9_server *s, struct p9_fcall *in,
 			p9s_debug("walk : qid = [%d] %x.%llx.%x\n",
 					nwqid, qid.type, qid.path, qid.version);
 
+			if (nwqid)
+				dput(dentry);
 			dentry = new_path.dentry;
 		}
 
 		if (!nwqid)
 			return err;
 
-		dput(new_path.dentry);
 	} else {
 		/* If nwname is 0, it's equivalent to walking
 		 * to the current directory. */
@@ -508,8 +497,7 @@ static int p9_op_create(struct p9_server *s, struct p9_fcall *in,
 	if (err)
 		return err;
 
-	set_owner(new_path.dentry, dfid->uid, gid, XATTR_CREATE);
-
+	set_owner(new_path.dentry, dfid->uid, gid);
 	new_filp = dentry_open(&new_path,
 		build_openflags(flags) | O_CREAT, current_cred());
 	if (IS_ERR(new_filp))
@@ -817,6 +805,18 @@ static int p9_op_setattr(struct p9_server *s, struct p9_fcall *in,
 	} else
 		iattr.ia_mtime.tv_nsec = UTIME_OMIT;
 
+	if (p9attr.valid & ATTR_UID) {
+		iattr.ia_valid |= ATTR_UID;
+		iattr.ia_uid.val = p9attr.uid.val;
+	}
+	if (p9attr.valid & ATTR_GID) {
+		iattr.ia_valid |= ATTR_GID;
+		iattr.ia_gid.val = p9attr.gid.val;
+	}
+	if (p9attr.valid & ATTR_CTIME) {
+		iattr.ia_valid |= ATTR_CTIME;
+		iattr.ia_ctime = current_time(dentry->d_inode);
+	}
 	if (iattr.ia_valid) {
 		inode_lock(dentry->d_inode);
 		err = notify_change(dentry, &iattr, NULL);
@@ -824,25 +824,8 @@ static int p9_op_setattr(struct p9_server *s, struct p9_fcall *in,
 		if (err < 0)
 			return err;
 	}
-	/*
-	 * If the only valid entry in iattr is ctime we can call
-	 * chown(-1,-1) to update the ctime of the file
-	 */
-	if ((p9attr.valid & (ATTR_UID | ATTR_GID))) {
-		int uid = -1;
-		int gid = -1;
-		if (p9attr.valid & ATTR_UID) {
-			uid = p9attr.uid.val;
-		}
-		if ((p9attr.valid & ATTR_GID)) {
-			gid = p9attr.gid.val;
-		}
-		set_owner(dentry, uid, gid, XATTR_REPLACE);
-	}
-
 	if (p9attr.valid & ATTR_SIZE) {
 		err = vfs_truncate(&fid->path, p9attr.size);
-
 		if (err < 0)
 			return err;
 	}
@@ -851,7 +834,7 @@ static int p9_op_setattr(struct p9_server *s, struct p9_fcall *in,
 }
 
 static int p9_op_write(struct p9_server *s, struct p9_fcall *in,
-					   struct p9_fcall *out)
+		struct p9_fcall *out)
 {
 	u64 offset;
 	u32 fid_val, count;
@@ -929,7 +912,7 @@ static int p9_op_unlinkat(struct p9_server *s, struct p9_fcall *in,
 
 	p9s_debug("unlinkat : fid %d, name %s\n", fid_val, name);
 	dentry = lookup_one_len(name, fid->path.dentry, strlen(name));
-
+	kfree(name);
 	if (d_really_is_negative(dentry))
 		return -ENOENT;
 
@@ -938,7 +921,7 @@ static int p9_op_unlinkat(struct p9_server *s, struct p9_fcall *in,
 	else
 		err = vfs_unlink(dentry->d_parent->d_inode, dentry, NULL);
 
-	p9s_debug("unlinkat : %s is removed\n", name);
+	p9s_debug("unlinkat : success\n");
 	return err;
 }
 
@@ -1246,7 +1229,7 @@ static int p9_op_readlink(struct p9_server *s, struct p9_fcall *in,
 		return PTR_ERR(link);
 
 	p9pdu_writef(out, "s", link);
-
+	kfree(link);
 	p9s_debug("readlink : path %s\n", link);
 
 	return 0;
@@ -1316,7 +1299,7 @@ static int p9_op_mknod(struct p9_server *s, struct p9_fcall *in,
 	if (err < 0)
 		return err;
 
-	// TODO: need chmod?
+	set_owner(new_path.dentry, dfid->uid, gid);
 
 	err = gen_qid(&new_path, &qid, NULL);
 	if (err)
