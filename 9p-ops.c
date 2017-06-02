@@ -1101,7 +1101,7 @@ static int p9_op_mkdir(struct p9_server *s, struct p9_fcall *in,
 	err = vfs_mkdir(dfid->path.dentry->d_inode, new_path.dentry, mode);
 	if (err < 0)
 		return err;
-
+	set_owner(new_path.dentry, dfid->uid, gid);
 	err = gen_qid(&new_path, &qid, NULL);
 	if (err)
 		return err;
