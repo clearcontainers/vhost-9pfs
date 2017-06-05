@@ -53,6 +53,19 @@ struct p9_server_fid {
 
 /* 9p helper routines */
 
+static struct dentry *p9_lookup_one_len(
+		const char *name, struct dentry *dentry, int len)
+{
+
+	if (!inode_is_locked(dentry->d_inode)) {
+		p9s_debug("lookup_one_len: inode %s is not locked\n",
+				dentry->d_name.name);
+		return lookup_one_len_unlocked(name, dentry, len);
+	}
+	p9s_debug("lookup_one_len: inode %s is locked\n",
+			dentry->d_name.name);
+	return lookup_one_len(name, dentry, len);
+}
 static struct p9_server_fid *lookup_fid(struct p9_server *s, u32 fid_val)
 {
 	struct rb_node *node = s->fids.rb_node;
@@ -319,9 +332,8 @@ static int p9_op_walk(struct p9_server *s, struct p9_fcall *in,
 			if (name[0] == '.' && name[1] == '.' && name[2] == '\0')
 				break;
 
-			// TODO: lock may be needed
 			new_path.dentry =
-				lookup_one_len(name, dentry, strlen(name));
+				p9_lookup_one_len(name, dentry, strlen(name));
 			kfree(name);
 			if (IS_ERR(new_path.dentry)) {
 				return PTR_ERR(new_path.dentry);
@@ -466,6 +478,7 @@ static int p9_op_create(struct p9_server *s, struct p9_fcall *in,
 	struct p9_server_fid *dfid;
 	struct path new_path;
 	struct file *new_filp;
+	struct dentry *dentry;
 
 	p9pdu_readf(in, "d", &dfid_val);
 
@@ -479,9 +492,9 @@ static int p9_op_create(struct p9_server *s, struct p9_fcall *in,
 	p9pdu_readf(in, "sddd", &name, &flags, &mode, &gid);
 	p9s_debug("create : fid %d name %s flags %d mode %d gid %d\n",
 			dfid_val, name, flags, mode, gid);
-
+	dentry = dfid->path.dentry;
 	new_path.mnt = dfid->path.mnt;
-	new_path.dentry = lookup_one_len(name, dfid->path.dentry, strlen(name));
+	new_path.dentry = p9_lookup_one_len(name, dentry, strlen(name));
 
 	kfree(name);
 
@@ -492,7 +505,7 @@ static int p9_op_create(struct p9_server *s, struct p9_fcall *in,
 		return -EEXIST;
 	}
 
-	err = vfs_create(dfid->path.dentry->d_inode, new_path.dentry,
+	err = vfs_create(dentry->d_inode, new_path.dentry,
 					 mode, build_openflags(flags) & O_EXCL);
 	if (err)
 		return err;
@@ -594,7 +607,7 @@ static int p9_readdir_cb(struct dir_context *ctx, const char *name, int namlen,
 			_ctx->parent->dentry : _ctx->parent->dentry->d_parent;
 	else
 		path.dentry =
-			lookup_one_len(name, _ctx->parent->dentry, namlen);
+			p9_lookup_one_len(name, _ctx->parent->dentry, namlen);
 
 	if (IS_ERR(path.dentry)) {
 		_ctx->err = PTR_ERR(path.dentry);
@@ -911,7 +924,7 @@ static int p9_op_unlinkat(struct p9_server *s, struct p9_fcall *in,
 		return PTR_ERR(fid);
 
 	p9s_debug("unlinkat : fid %d, name %s\n", fid_val, name);
-	dentry = lookup_one_len(name, fid->path.dentry, strlen(name));
+	dentry = p9_lookup_one_len(name, fid->path.dentry, strlen(name));
 	kfree(name);
 	if (d_really_is_negative(dentry))
 		return -ENOENT;
@@ -1031,7 +1044,7 @@ static int p9_op_renameat(struct p9_server *s, struct p9_fcall *in,
 	p9s_debug("renameat: oldfid %d, oldname %s, newfid %d, newname %s\n",
 			oldfid_val, oldname, newfid_val, newname);
 
-	old_dentry = lookup_one_len(oldname, oldfid->path.dentry,
+	old_dentry = p9_lookup_one_len(oldname, oldfid->path.dentry,
 					 strlen(oldname));
 	if (IS_ERR(old_dentry)) {
 		err = PTR_ERR(old_dentry);
@@ -1042,7 +1055,7 @@ static int p9_op_renameat(struct p9_server *s, struct p9_fcall *in,
 		goto out;
 	}
 
-	new_dentry = lookup_one_len(newname, newfid->path.dentry,
+	new_dentry = p9_lookup_one_len(newname, newfid->path.dentry,
 					 strlen(newname));
 	if (IS_ERR(new_dentry)) {
 		err = PTR_ERR(new_dentry);
@@ -1072,6 +1085,7 @@ static int p9_op_mkdir(struct p9_server *s, struct p9_fcall *in,
 	struct p9_qid qid;
 	struct p9_server_fid *dfid;
 	struct path new_path;
+	struct dentry *dentry;
 
 	p9pdu_readf(in, "d", &dfid_val);
 
@@ -1084,8 +1098,9 @@ static int p9_op_mkdir(struct p9_server *s, struct p9_fcall *in,
 	p9s_debug("mkdir : fid %d name %s mode %d gid %d\n",
 			dfid->fid, name, mode, gid);
 
+	dentry = dfid->path.dentry;
 	new_path.mnt = dfid->path.mnt;
-	new_path.dentry = lookup_one_len(name, dfid->path.dentry, strlen(name));
+	new_path.dentry = p9_lookup_one_len(name, dentry, strlen(name));
 
 	kfree(name);
 
@@ -1098,7 +1113,7 @@ static int p9_op_mkdir(struct p9_server *s, struct p9_fcall *in,
 
 	// TODO: verify dfid's inode is valid
 
-	err = vfs_mkdir(dfid->path.dentry->d_inode, new_path.dentry, mode);
+	err = vfs_mkdir(dentry->d_inode, new_path.dentry, mode);
 	if (err < 0)
 		return err;
 	set_owner(new_path.dentry, dfid->uid, gid);
@@ -1136,7 +1151,7 @@ static int p9_op_symlink(struct p9_server *s, struct p9_fcall *in,
 
 	symlink_path.mnt = fid->path.mnt;
 	symlink_path.dentry =
-		lookup_one_len(name, fid->path.dentry, strlen(name));
+		p9_lookup_one_len(name, fid->path.dentry, strlen(name));
 	kfree(name);
 
 	if (d_really_is_positive(symlink_path.dentry)) {
@@ -1188,7 +1203,7 @@ static int p9_op_link(struct p9_server *s, struct p9_fcall *in,
 	p9pdu_readf(in, "s", &name);
 	p9s_debug("link : name %s\n", name);
 
-	new_dentry = lookup_one_len(name, dfid->path.dentry, strlen(name));
+	new_dentry = p9_lookup_one_len(name, dfid->path.dentry, strlen(name));
 
 	kfree(name);
 
@@ -1229,9 +1244,7 @@ static int p9_op_readlink(struct p9_server *s, struct p9_fcall *in,
 		return PTR_ERR(link);
 
 	p9pdu_writef(out, "s", link);
-	kfree(link);
 	p9s_debug("readlink : path %s\n", link);
-
 	return 0;
 }
 
@@ -1269,6 +1282,7 @@ static int p9_op_mknod(struct p9_server *s, struct p9_fcall *in,
 	struct p9_qid qid;
 	struct p9_server_fid *dfid;
 	struct path new_path;
+	struct dentry *dentry;
 
 	p9pdu_readf(in, "d", &dfid_val);
 
@@ -1281,8 +1295,9 @@ static int p9_op_mknod(struct p9_server *s, struct p9_fcall *in,
 	p9s_debug("mknod : name %s mode %d major %d minor %d\n",
 		name, mode, major, minor);
 
+	dentry = dfid->path.dentry;
 	new_path.mnt = dfid->path.mnt;
-	new_path.dentry = lookup_one_len(name, dfid->path.dentry, strlen(name));
+	new_path.dentry = p9_lookup_one_len(name, dentry, strlen(name));
 
 	kfree(name);
 
@@ -1293,7 +1308,7 @@ static int p9_op_mknod(struct p9_server *s, struct p9_fcall *in,
 		return -EEXIST;
 	}
 
-	err = vfs_mknod(dfid->path.dentry->d_inode, new_path.dentry,
+	err = vfs_mknod(dentry->d_inode, new_path.dentry,
 			mode, MKDEV(major, minor));
 
 	if (err < 0)
