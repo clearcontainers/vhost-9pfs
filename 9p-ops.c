@@ -52,6 +52,33 @@ struct p9_server_fid {
 };
 
 /* 9p helper routines */
+/* clear SUID/SGID when writing to the file by non-owner */
+static void p9_clear_sugid(struct p9_server *s, struct p9_server_fid *fid)
+{
+	int err;
+	struct kstat st;
+
+	err = vfs_getattr(&fid->path, &st);
+	if (err)
+		return;
+	p9s_debug("p9_clear_sugid: user  %d, file user %d\n",
+			fid->uid, st.uid.val);
+	if (st.uid.val == fid->uid)
+		return;
+	if (st.mode & (S_ISUID | S_ISGID)) {
+		struct iattr iattr;
+		struct dentry *dentry = fid->path.dentry;
+
+		memset(&iattr, 0, sizeof(struct iattr));
+		iattr.ia_valid |= ATTR_MODE;
+		iattr.ia_mode = st.mode & (~S_ISUID);
+		iattr.ia_mode &= ~S_ISGID;
+		iattr.ia_ctime = current_time(dentry->d_inode);
+		inode_lock(dentry->d_inode);
+		notify_change(dentry, &iattr, NULL);
+		inode_unlock(dentry->d_inode);
+	}
+}
 
 static struct dentry *p9_lookup_one_len(
 		const char *name, struct dentry *dentry, int len)
@@ -874,6 +901,7 @@ static int p9_op_write(struct p9_server *s, struct p9_fcall *in,
 	if (len < 0)
 		return len;
 
+	p9_clear_sugid(s, fid);
 	p9pdu_writef(out, "d", (u32) len);
 	p9s_debug("wrote : count %d\n", count);
 	return 0;
@@ -900,10 +928,10 @@ static int p9_op_writev(struct p9_server *s, struct p9_fcall *in,
 		data->count = count;
 
 	len = vfs_iter_write(fid->filp, data, &offset);
-
 	if (len < 0)
 		return len;
 
+	p9_clear_sugid(s, fid);
 	p9pdu_writef(out, "d", (u32) len);
 	return 0;
 }
