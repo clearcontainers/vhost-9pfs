@@ -3,7 +3,7 @@
 
 #include "vhost.h"
 
-#define DEBUG 1
+//#define DEBUG 1
 #ifdef DEBUG
 #define p9s_debug(fmt, ...)           \
     pr_info(fmt, ##__VA_ARGS__)

@@ -93,6 +93,7 @@ static struct dentry *p9_lookup_one_len(
 			dentry->d_name.name);
 	return lookup_one_len(name, dentry, len);
 }
+
 static struct p9_server_fid *lookup_fid(struct p9_server *s, u32 fid_val)
 {
 	struct rb_node *node = s->fids.rb_node;
@@ -313,7 +314,6 @@ static int p9_op_clunk(struct p9_server *s, struct p9_fcall *in,
 		filp_close(fid->filp, NULL);
 
 	rb_erase(&fid->node, &s->fids);
-	dput(fid->path.dentry);
 	kfree(fid);
 	p9s_debug("fid : %d destroyed\n", fid_val);
 	return 0;
@@ -1552,7 +1552,7 @@ void do_9p_request(struct p9_server *s, struct iov_iter *req,
 	in->id = cmd = hdr->id;
 	out->id = hdr->id + 1;
 
-	pr_notice("do_9p_request: %s! %d\n", translate[cmd], in->tag);
+	p9s_debug("do_9p_request: %s! %d\n", translate[cmd], in->tag);
 
 	if (cmd < ARRAY_SIZE(p9_ops) && p9_ops[cmd]) {
 		if (cmd == P9_TREAD || cmd == P9_TWRITE) {
