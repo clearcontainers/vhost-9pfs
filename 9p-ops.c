@@ -271,6 +271,7 @@ static int p9_op_getattr(struct p9_server *s, struct p9_fcall *in,
 	struct p9_server_fid *fid;
 	struct kstat st;
 	struct p9_qid qid;
+	u64 dev;
 
 	p9pdu_readf(in, "dq", &fid_val, &request_mask);
 	p9s_debug("getattr : fid %d, request_mask %lld\n",
@@ -284,9 +285,10 @@ static int p9_op_getattr(struct p9_server *s, struct p9_fcall *in,
 	if (err)
 		return err;
 
+	dev = new_encode_dev(st.rdev);
 	p9pdu_writef(out, "qQdugqqqqqqqqqqqqqqq",
 		P9_STATS_BASIC, &qid, st.mode, st.uid, st.gid,
-		st.nlink, st.rdev, st.size, st.blksize, st.blocks,
+		st.nlink, dev, st.size, st.blksize, st.blocks,
 		st.atime.tv_sec, st.atime.tv_nsec,
 		st.mtime.tv_sec, st.mtime.tv_nsec,
 		st.ctime.tv_sec, st.ctime.tv_nsec,
