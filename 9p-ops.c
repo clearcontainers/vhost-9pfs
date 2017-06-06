@@ -1088,10 +1088,6 @@ static int p9_op_renameat(struct p9_server *s, struct p9_fcall *in,
 	if (IS_ERR(new_dentry)) {
 		err = PTR_ERR(new_dentry);
 		goto out;
-	} else if (d_really_is_positive(new_dentry)) {
-		pr_err("renameat: destiny file %s exists!\n", newname);
-		err = -EEXIST;
-		goto out;
 	}
 	p9s_debug("renameat: call vfs_rename\n");
 
