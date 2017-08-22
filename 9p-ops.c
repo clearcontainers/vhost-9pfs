@@ -149,6 +149,10 @@ static struct p9_server_fid *new_xattr_fid(struct p9_server *s, u32 fid_val,
 {
 	struct p9_server_fid *fid = NULL;
 	fid = new_fid(s, fid_val, path);
+	if (IS_ERR(fid)) {
+		p9s_debug ("new_xattr_fid: Error creating fid for fid_val %d\n", fid_val);
+		return fid;
+	}
 	fid->fid_type = P9_FID_XATTR;
 	fid->ref = 0;
 	fid->clunked = 0;
@@ -1477,7 +1481,6 @@ static int p9_op_xattrcreate(struct p9_server *s, struct p9_fcall *in,
 	ssize_t size;
 	ssize_t err = 0;
 	char *name;
-	size_t offset = 7;
 	struct p9_server_fid *xattr_fidp;
 
 	p9s_debug("xattrcreate\n");
@@ -1518,7 +1521,7 @@ static int p9_op_xattrcreate(struct p9_server *s, struct p9_fcall *in,
 		if (size > 0) {
 			/* The value will be written from p9_op_write */
 			xattr_fidp->xattr.value = (char *)kmalloc(size + 1, GFP_KERNEL);
-		} else {
+	        } else if (size == 0) {
 			/* When setfattr -n user.name1 <filename> is being called
 			 * only xattrcreate with flags 0 and value null is being called.
 			 * No corresponding p9_op_write is being called.
@@ -1530,12 +1533,12 @@ static int p9_op_xattrcreate(struct p9_server *s, struct p9_fcall *in,
 					   xattr_fidp->xattr.value,
 					   xattr_fidp->xattr.len,
 					   xattr_fidp->xattr.flags);
-			p9s_debug("xattrcreate : xfid %d set value to null\n", fid);
+		} else {
+			p9s_debug("xattrcreate : xfid %d found no data\n", fid);
+			return -ENODATA;
 		}
 	}
 
-	err = offset;
-	p9pdu_writef(out, "d", err);
 	return 0;
 }
 
@@ -1564,7 +1567,13 @@ static int p9_op_xattrwalk(struct p9_server *s, struct p9_fcall *in,
 	/* Check when to free name. This is allocated by p9pdu_readf */
 	xattr_fidp = new_xattr_fid(s, new_fid_val, &file_fidp->path, name);
 	if (IS_ERR(xattr_fidp)) {
-		return PTR_ERR(xattr_fidp);
+		if (ERR_CAST(xattr_fidp) == ERR_PTR(-EEXIST)) {
+			p9s_debug ("xattr_walk: New fid exists\n");
+			return -EEXIST;
+		} else if (ERR_CAST(xattr_fidp) == ERR_PTR(-ENOMEM)) {
+			p9s_debug ("xattr_walk: No memory for for new fid\n");
+			return -ENOMEM;
+		}
 	}
 
 	xattr_fidp->xattr.xattrwalk_fid = true;
@@ -1584,22 +1593,18 @@ static int p9_op_xattrwalk(struct p9_server *s, struct p9_fcall *in,
 
 			rb_erase(&xattr_fidp->node, &s->fids);
 			kfree(xattr_fidp);
+			p9pdu_writef(out, "q", size);
 			return 0;
 		}
 		/*
 		 * Read the xattr value
 		 */
 		xattr_fidp->xattr.len = size;
-		if (size >= 0) {
-			xattr_fidp->xattr.value = (char *)kmalloc(size + 1, GFP_KERNEL);
-			size = vfs_listxattr(file_fidp->path.dentry,
-					xattr_fidp->xattr.value,
-						size);
-			p9pdu_writef(out, "q", size);
-		} else {
-			p9pdu_writef(out, "q", 0);
-			goto no_fid;
-		}
+		xattr_fidp->xattr.value = (char *)kmalloc(size + 1, GFP_KERNEL);
+		size = vfs_listxattr(file_fidp->path.dentry,
+				xattr_fidp->xattr.value, size);
+		p9pdu_writef(out, "q", size);
+		return 0;
 	} else {
 		/*
 		 * specific xattr fid. We check for xattr
@@ -1608,21 +1613,23 @@ static int p9_op_xattrwalk(struct p9_server *s, struct p9_fcall *in,
 		size = vfs_getxattr(file_fidp->path.dentry, name, NULL, 0);
 		p9s_debug("xattrwalk : name2: %s, size2 %ld", name, size);
 		/* Make the file fid point to xattr */
-		if (size > 0) {
+		if (size >= 0) {
 			xattr_fidp->xattr.len = size;
 			xattr_fidp->xattr.value = (char *)kmalloc (size + 1, GFP_KERNEL);
 			vfs_getxattr(file_fidp->path.dentry, name,
 				xattr_fidp->xattr.value, size);
 			xattr_fidp->xattr.value[size] = '\0';
-			p9pdu_writef(out, "qs", size, xattr_fidp->xattr.value);
-		} else if (size <= 0) {
-			/* Any xatrr might empty value */
-			p9pdu_writef(out, "q", 0);
+			p9pdu_writef(out, "q", size);
+		} else {
+			if (!IS_ERR_OR_NULL(xattr_fidp->filp))
+				filp_close(xattr_fidp->filp, NULL);
+			rb_erase(&xattr_fidp->node, &s->fids);
+			kfree(xattr_fidp);
+			return -ENODATA;
 		}
 	}
 no_fid:
 	p9s_debug("xattrwalk : fid %d\n", fid_val);
-	p9pdu_writef(out, "d", 7);
 	return 0;
 }
 
