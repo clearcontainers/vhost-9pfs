@@ -33,4 +33,32 @@ struct p9_server *p9_server_create(struct path *root);
 void p9_server_close(struct p9_server *s);
 void do_9p_request(struct p9_server *s, struct iov_iter *req, struct iov_iter *resp);
 
+enum {
+	P9_FID_NONE = 0,
+	P9_FID_FILE,
+	P9_FID_DIR,
+	P9_FID_XATTR,
+};
+
+typedef struct p9_xattr_field {
+	uint64_t copied_len;
+	uint64_t len;
+	char *value;
+	char *name;
+	int flags;
+	bool xattrwalk_fid;
+} p9_xattr_field;
+
+struct p9_server_fid {
+	u32 fid;
+	u32 uid;
+	struct path path;
+	struct file *filp;
+	struct rb_node node;
+	int fid_type;
+	int ref;
+	int clunked;
+	p9_xattr_field xattr;
+};
+
 #endif

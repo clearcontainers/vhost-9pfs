@@ -43,14 +43,6 @@
 #define MAX_FILE_NAME (NAME_MAX + 1)
 const size_t P9_PDU_HDR_LEN = sizeof(u32) + sizeof(u8) + sizeof(u16);
 
-struct p9_server_fid {
-	u32 fid;
-	u32 uid;
-	struct path path;
-	struct file *filp;
-	struct rb_node node;
-};
-
 /* 9p helper routines */
 /* clear SUID/SGID when writing to the file by non-owner */
 static void p9_clear_sugid(struct p9_server *s, struct p9_server_fid *fid)
@@ -143,11 +135,34 @@ static struct p9_server_fid *new_fid(struct p9_server *s, u32 fid_val,
 	fid->uid = s->uid;
 	fid->filp = NULL;
 	fid->path = *path;
+	fid->fid_type = P9_FID_NONE;
 
 	rb_link_node(&fid->node, parent, node);
 	rb_insert_color(&fid->node, &s->fids);
 	p9s_debug("fid : %d created\n", fid_val);
 
+	return fid;
+}
+
+static struct p9_server_fid *new_xattr_fid(struct p9_server *s, u32 fid_val,
+					struct path *path, char *name)
+{
+	struct p9_server_fid *fid = NULL;
+	fid = new_fid(s, fid_val, path);
+	fid->fid_type = P9_FID_XATTR;
+	fid->ref = 0;
+	fid->clunked = 0;
+	fid->xattr.len = 0;
+	fid->xattr.copied_len = 0;
+	fid->xattr.xattrwalk_fid = false;
+	fid->xattr.flags = 0;
+	if (name) {
+		fid->xattr.name = kstrdup(name, GFP_KERNEL);
+	}
+	else {
+		fid->xattr.name = NULL;
+	}
+	fid->xattr.value = NULL;
 	return fid;
 }
 
@@ -305,13 +320,27 @@ static int p9_op_clunk(struct p9_server *s, struct p9_fcall *in,
 	struct p9_server_fid *fid;
 
 	p9pdu_readf(in, "d", &fid_val);
-	p9s_debug("destroy fid : %d\n", fid_val);
 	fid = lookup_fid(s, fid_val);
 	if (IS_ERR(fid))
 		return 0;
 
-	if (!IS_ERR_OR_NULL(fid->filp))
-		filp_close(fid->filp, NULL);
+	p9s_debug("p9_op_clunk: fid : %d, type %d\n", fid_val,
+						fid->fid_type);
+	if (fid->fid_type == P9_FID_XATTR) {
+		/* Be paranoid otherwise you crash the host */
+#if 0
+		if (strlen(fid->xattr.name)) {
+			kfree(fid->xattr.name);
+		}
+		if (fid->xattr.len > 0) {
+			   kfree(fid->xattr.value);
+		}
+#endif
+	}
+	else {
+		if (!IS_ERR_OR_NULL(fid->filp))
+			filp_close(fid->filp, NULL);
+	}
 
 	rb_erase(&fid->node, &s->fids);
 	kfree(fid);
@@ -722,25 +751,35 @@ static int p9_op_read(struct p9_server *s, struct p9_fcall *in,
 	mm_segment_t fs;
 
 	p9pdu_readf(in, "dqd", &fid_val, &offset, &count);
-	p9s_debug("read : fid %d offset %llu count %d\n",
+	p9s_debug("p9_op_read : fid %d offset %llu count %d\n",
 			fid_val, (unsigned long long) offset, count);
 
 	fid = lookup_fid(s, fid_val);
-	if (IS_ERR(fid))
-		return PTR_ERR(fid);
+	if (fid->fid_type == P9_FID_XATTR) {
+		if (count > fid->xattr.len) {
+			count = fid->xattr.len;
+		}
+		p9s_debug("p9_op_read: reading xattr value %d %s\n", count, fid->xattr.value);
+		memcpy(out->sdata + out->size, fid->xattr.value, count);
+		out->size += count;
+		len = count;
+	} else {
+		if (IS_ERR(fid))
+			return PTR_ERR(fid);
 
-	if (IS_ERR_OR_NULL(fid->filp))
-		return -EBADF;
+		if (IS_ERR_OR_NULL(fid->filp))
+			return -EBADF;
 
-	out->size += sizeof(u32);
+		out->size += sizeof(u32);
 
-	if (count + out->size > out->capacity)
-		count = out->capacity - out->size;
+		if (count + out->size > out->capacity)
+			count = out->capacity - out->size;
 
-	fs = get_fs();
-	set_fs(KERNEL_DS);
-	len = vfs_read(fid->filp, out->sdata + out->size, count, &offset);
-	set_fs(fs);
+		fs = get_fs();
+		set_fs(KERNEL_DS);
+		len = vfs_read(fid->filp, out->sdata + out->size, count, &offset);
+		set_fs(fs);
+	}
 
 	if (len < 0)
 		return len;
@@ -883,22 +922,40 @@ static int p9_op_write(struct p9_server *s, struct p9_fcall *in,
 	ssize_t len;
 	struct p9_server_fid *fid;
 	mm_segment_t fs;
+	int err;
 
 	p9pdu_readf(in, "dqd", &fid_val, &offset, &count);
-	p9s_debug("write : fid %d offset %llu count %d\n",
+	p9s_debug("p9_op_write : fid %d offset %llu count %d\n",
 			fid_val, (unsigned long long) offset, count);
 
 	fid = lookup_fid(s, fid_val);
-	if (IS_ERR(fid))
-		return PTR_ERR(fid);
+	p9s_debug("p9_op_write:fid->type:%d, fid_val:%d\n",
+		   fid->fid_type, fid_val);
 
-	if (IS_ERR_OR_NULL(fid->filp))
-		return -EBADF;
+	if (fid->fid_type == P9_FID_XATTR) {
+		memcpy(fid->xattr.value, in->sdata + in->offset, fid->xattr.len);
+		fid->xattr.value[fid->xattr.len] = '\0';
+		len = fid->xattr.copied_len = fid->xattr.len;
+		err = vfs_setxattr(fid->path.dentry,
+				fid->xattr.name,
+				fid->xattr.value,
+				fid->xattr.len,
+				fid->xattr.flags);
+		p9s_debug("p9_op_write: wrote value %s, for name %s, err %d\n",
+			fid->xattr.value, fid->xattr.name, err);
+	} else {
+		if (IS_ERR(fid))
+			return PTR_ERR(fid);
 
-	fs = get_fs();
-	set_fs(KERNEL_DS);
-	len = vfs_write(fid->filp, in->sdata + in->offset, count, &offset);
-	set_fs(fs);
+		if (IS_ERR_OR_NULL(fid->filp))
+			return -EBADF;
+
+		p9s_debug("p9_op_write: Writing to file\n");
+		fs = get_fs();
+		set_fs(KERNEL_DS);
+		len = vfs_write(fid->filp, in->sdata + in->offset, count, &offset);
+		set_fs(fs);
+	}
 
 	if (len < 0)
 		return len;
@@ -1412,6 +1469,163 @@ static int p9_op_flush(struct p9_server *s, struct p9_fcall *in,
 	return 0;
 }
 
+static int p9_op_xattrcreate(struct p9_server *s, struct p9_fcall *in,
+				struct p9_fcall *out)
+{
+	int flags;
+	int32_t fid;
+	ssize_t size;
+	ssize_t err = 0;
+	char *name;
+	size_t offset = 7;
+	struct p9_server_fid *xattr_fidp;
+
+	p9s_debug("xattrcreate\n");
+	err = p9pdu_readf(in, "dsqd", &fid, &name,  &size, &flags);
+	if (err < 0) {
+		err = -EINVAL;
+		return err;
+	}
+
+	if (size > XATTR_SIZE_MAX) {
+		err = -E2BIG;
+		return err;
+	}
+
+	p9s_debug("xattrcreate : fid %d, name %s, size: %ld, flags: 0x%x\n",
+						fid, name, size, flags);
+
+	xattr_fidp = lookup_fid(s, fid);
+
+	p9s_debug("xattrcreate : xfid %d found\n", fid);
+	if (xattr_fidp == NULL) {
+		err = -EINVAL;
+		return err;
+	}
+
+	/* Make the file fid point to xattr */
+	xattr_fidp->fid_type = P9_FID_XATTR;
+	xattr_fidp->xattr.copied_len = 0;
+	xattr_fidp->xattr.xattrwalk_fid = false;
+	xattr_fidp->xattr.len = size;
+	xattr_fidp->xattr.flags = flags;
+
+	if (flags == 0x02) {
+		/* This is setup for delete */
+		vfs_removexattr(xattr_fidp->path.dentry, name);
+	} else {
+		xattr_fidp->xattr.name = kstrdup(name, GFP_KERNEL);
+		if (size > 0) {
+			/* The value will be written from p9_op_write */
+			xattr_fidp->xattr.value = (char *)kmalloc(size + 1, GFP_KERNEL);
+		} else {
+			/* When setfattr -n user.name1 <filename> is being called
+			 * only xattrcreate with flags 0 and value null is being called.
+			 * No corresponding p9_op_write is being called.
+			 * Hence set the file xattr to NULL here
+			 */
+			xattr_fidp->xattr.value = NULL;
+			err = vfs_setxattr(xattr_fidp->path.dentry,
+					   xattr_fidp->xattr.name,
+					   xattr_fidp->xattr.value,
+					   xattr_fidp->xattr.len,
+					   xattr_fidp->xattr.flags);
+			p9s_debug("xattrcreate : xfid %d set value to null\n", fid);
+		}
+	}
+
+	err = offset;
+	p9pdu_writef(out, "d", err);
+	return 0;
+}
+
+static int p9_op_xattrwalk(struct p9_server *s, struct p9_fcall *in,
+					  struct p9_fcall *out)
+{
+	u32 fid_val, new_fid_val;
+	char *name;
+	struct p9_server_fid *file_fidp;
+	struct p9_server_fid *xattr_fidp = NULL;
+	int err = 0;
+	ssize_t size;
+
+	err = p9pdu_readf(in, "dds", &fid_val, &new_fid_val,  &name);
+	if (err < 0) {
+		p9pdu_writef(out, "q", 0);
+		goto no_fid;
+	}
+	p9s_debug("xattrwalk : fid %d, new_val %d, name %s\n",
+			fid_val, new_fid_val, name);
+
+	file_fidp = lookup_fid(s, fid_val);
+	if (IS_ERR(file_fidp))
+		return PTR_ERR(file_fidp);
+
+	/* Check when to free name. This is allocated by p9pdu_readf */
+	xattr_fidp = new_xattr_fid(s, new_fid_val, &file_fidp->path, name);
+	if (IS_ERR(xattr_fidp)) {
+		return PTR_ERR(xattr_fidp);
+	}
+
+	xattr_fidp->xattr.xattrwalk_fid = true;
+
+	if (!strlen(name)) {
+		/*
+		 * listxattr request. Get the size first
+		 */
+		size = vfs_listxattr(file_fidp->path.dentry, NULL, 0);
+		p9s_debug("xattrwalk : listxattr return %ld size\n", size);
+
+		/* Size can be zero, as the attribute might be empty */
+		if (size < 0) {
+			err = size;
+			if (!IS_ERR_OR_NULL(xattr_fidp->filp))
+				filp_close(xattr_fidp->filp, NULL);
+
+			rb_erase(&xattr_fidp->node, &s->fids);
+			kfree(xattr_fidp);
+			return 0;
+		}
+		/*
+		 * Read the xattr value
+		 */
+		xattr_fidp->xattr.len = size;
+		if (size >= 0) {
+			xattr_fidp->xattr.value = (char *)kmalloc(size + 1, GFP_KERNEL);
+			size = vfs_listxattr(file_fidp->path.dentry,
+					xattr_fidp->xattr.value,
+						size);
+			p9pdu_writef(out, "q", size);
+		} else {
+			p9pdu_writef(out, "q", 0);
+			goto no_fid;
+		}
+	} else {
+		/*
+		 * specific xattr fid. We check for xattr
+		 * presence also collect the xattr size
+		 */
+		size = vfs_getxattr(file_fidp->path.dentry, name, NULL, 0);
+		p9s_debug("xattrwalk : name2: %s, size2 %ld", name, size);
+		/* Make the file fid point to xattr */
+		if (size > 0) {
+			xattr_fidp->xattr.len = size;
+			xattr_fidp->xattr.value = (char *)kmalloc (size + 1, GFP_KERNEL);
+			vfs_getxattr(file_fidp->path.dentry, name,
+				xattr_fidp->xattr.value, size);
+			xattr_fidp->xattr.value[size] = '\0';
+			p9pdu_writef(out, "qs", size, xattr_fidp->xattr.value);
+		} else if (size <= 0) {
+			/* Any xatrr might empty value */
+			p9pdu_writef(out, "q", 0);
+		}
+	}
+no_fid:
+	p9s_debug("xattrwalk : fid %d\n", fid_val);
+	p9pdu_writef(out, "d", 7);
+	return 0;
+}
+
 typedef int p9_server_op(struct p9_server *s, struct p9_fcall *in,
 			struct p9_fcall *out);
 
@@ -1426,8 +1640,8 @@ static p9_server_op *p9_ops[] = {
 	[P9_TREADLINK]	  = p9_op_readlink,
 	[P9_TGETATTR]	  = p9_op_getattr,
 	[P9_TSETATTR]	  = p9_op_setattr,
-//	[P9_TXATTRWALK]   = p9_op_xattrwalk,	// Not implemented
-//	[P9_TXATTRCREATE] = p9_op_xattrcreate,	// Not implemented
+	[P9_TXATTRWALK]   = p9_op_xattrwalk,
+	[P9_TXATTRCREATE] = p9_op_xattrcreate,
 	[P9_TREADDIR]	  = p9_op_readdir,
 	[P9_TFSYNC]		  = p9_op_fsync,
 	[P9_TLOCK]		  = p9_op_lock,
